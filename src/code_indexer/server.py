@@ -1,0 +1,424 @@
+"""
+MCP server entry point.
+
+Exposes 8 tools over stdio:
+  set_project_path, get_index_status, build_deep_index,
+  find_files, get_file_summary, get_symbol_body,
+  search_code, semantic_search
+"""
+
+import hashlib
+import logging
+import os
+import tempfile
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from mcp.server.fastmcp import FastMCP
+
+from .constants import (
+    DEEP_INDEX_DB_FILE,
+    EMBED_MODEL,
+    OLLAMA_BASE_URL,
+    SHALLOW_INDEX_FILE,
+    _CACHE_BASE,
+)
+from .embeddings.ollama_client import OllamaClient, ModelNotFoundError
+from .embeddings.vector_store import VectorStore
+from .indexing.deep_index import DeepIndex
+from .indexing.shallow_index import ShallowIndex
+from .indexing.strategies.factory import StrategyFactory
+from .search.grep_search import search_code as _grep_search_code
+from .watcher.file_watcher import FileWatcherService
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Singletons ────────────────────────────────────────────────────────────────
+
+_factory = StrategyFactory()
+_ollama = OllamaClient(base_url=OLLAMA_BASE_URL, model=EMBED_MODEL)
+_watcher = FileWatcherService()
+
+# Mutable state — replaced each time set_project_path is called
+_state: dict = {
+    "project_path": None,
+    "cache_dir": None,
+    "shallow": None,   # ShallowIndex
+    "deep": None,      # DeepIndex
+    "vector": None,    # VectorStore
+}
+
+
+def _cache_dir_for(project_path: str) -> str:
+    """Deterministic cache directory based on the project path."""
+    h = hashlib.md5(project_path.encode()).hexdigest()[:12]
+    d = os.path.join(_CACHE_BASE, h)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _require_project() -> dict:
+    if _state["project_path"] is None:
+        raise ValueError("No project set. Call set_project_path first.")
+    return _state
+
+
+def _rebuild_callback(file_path: str):
+    """Called by the file watcher when a file changes."""
+    state = _state
+    if state["deep"] is None:
+        return
+    logger.info("Auto-reindexing: %s", file_path)
+    state["deep"].rebuild_file(file_path)
+
+
+# ── MCP server ────────────────────────────────────────────────────────────────
+
+mcp = FastMCP("barnacle-search")
+
+
+@mcp.tool()
+def set_project_path(path: str) -> str:
+    """
+    Set the project root directory to index.
+
+    Builds the shallow (file list) index immediately and starts the file watcher
+    for automatic reindexing. Call build_deep_index() afterwards for full symbol
+    extraction and semantic search support.
+
+    Args:
+        path: Absolute or relative path to the project root directory.
+
+    Returns:
+        Status message with file count and detected languages.
+    """
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(abs_path):
+        raise ValueError(f"Not a directory: {abs_path}")
+
+    cache_dir = _cache_dir_for(abs_path)
+    shallow_path = os.path.join(cache_dir, SHALLOW_INDEX_FILE)
+    db_path = os.path.join(cache_dir, DEEP_INDEX_DB_FILE)
+
+    # Build shallow index
+    shallow = ShallowIndex()
+    shallow.build(abs_path)
+    shallow.save(shallow_path)
+
+    # Initialize deep index (creates schema if needed)
+    deep = DeepIndex(abs_path, db_path, _factory)
+    vector = VectorStore(deep.store_ref)
+
+    # Stop old watcher if any
+    _watcher.stop()
+
+    # Update global state
+    _state["project_path"] = abs_path
+    _state["cache_dir"] = cache_dir
+    _state["shallow"] = shallow
+    _state["deep"] = deep
+    _state["vector"] = vector
+
+    # Start watcher
+    _watcher.start(abs_path, _rebuild_callback)
+
+    stats = shallow.get_stats()
+    lang_summary = ", ".join(
+        f"{lang}: {count}" for lang, count in sorted(stats["by_language"].items())
+    )
+    return (
+        f"Project set to: {abs_path}\n"
+        f"Files found: {stats['total']}\n"
+        f"Languages: {lang_summary or 'none'}\n"
+        f"File watcher started. Run build_deep_index() for full symbol extraction."
+    )
+
+
+@mcp.tool()
+def get_index_status() -> dict:
+    """
+    Return the current index status.
+
+    Returns a dict with:
+      - project_path: currently indexed project
+      - shallow: file count and language breakdown
+      - deep: whether built, file/symbol/embedding counts, built_at timestamp
+      - watcher: monitoring status
+    """
+    state = _require_project()
+
+    shallow_stats = state["shallow"].get_stats() if state["shallow"] else {}
+    deep_stats = state["deep"].get_stats() if state["deep"] else {}
+    watcher_status = _watcher.get_status()
+
+    return {
+        "project_path": state["project_path"],
+        "shallow": shallow_stats,
+        "deep": {
+            "built": state["deep"].is_built() if state["deep"] else False,
+            **deep_stats,
+        },
+        "watcher": watcher_status,
+    }
+
+
+@mcp.tool()
+async def build_deep_index(force_rebuild: bool = False) -> dict:
+    """
+    Build the full deep index: parse all files for symbols, then generate
+    Ollama embeddings for semantic search.
+
+    Args:
+        force_rebuild: If True, re-parse all files even if unchanged.
+
+    Returns:
+        Dict with files, symbols, errors, embeddings counts and model used.
+    """
+    state = _require_project()
+    deep: DeepIndex = state["deep"]
+    vector: VectorStore = state["vector"]
+
+    # Phase 1: parse all files
+    build_stats = deep.build(force_rebuild=force_rebuild)
+
+    # Phase 2: generate embeddings via Ollama
+    embed_count = 0
+    embed_skipped = False
+
+    ollama_ok = await _ollama.is_available()
+    if not ollama_ok:
+        logger.warning(
+            "Ollama not reachable at %s — skipping embeddings. "
+            "Run `ollama serve` and pull %s to enable semantic search.",
+            OLLAMA_BASE_URL,
+            EMBED_MODEL,
+        )
+        embed_skipped = True
+    else:
+        from .models.file_info import FileInfo
+
+        # Find files that don't have embeddings yet (or force_rebuild wipes all)
+        all_paths = deep.store_ref.get_all_file_paths()
+        if force_rebuild:
+            paths_needing_embed = all_paths
+        else:
+            embedded = deep.store_ref.get_embedded_paths()
+            paths_needing_embed = [p for p in all_paths if p not in embedded]
+
+        builder = deep.builder
+        BATCH_SIZE = 32  # embed 32 files per API call
+
+        # Build (file_id, embed_text) pairs
+        pending: list[tuple[int, str]] = []
+        for file_path in paths_needing_embed:
+            row = deep.store_ref.get_file(file_path)
+            if row is None:
+                continue
+            summary = deep.get_file_summary(file_path)
+            if summary is None:
+                continue
+            fi = FileInfo(
+                path=file_path,
+                language=row["language"] or "",
+                line_count=row["line_count"] or 0,
+                mtime=row["mtime"] or 0.0,
+                imports=summary.get("imports", []),
+                exports=summary.get("exports", []),
+            )
+            text = builder.build_embed_text(file_path, fi)
+            pending.append((row["id"], text))
+
+        # Send in batches
+        for i in range(0, len(pending), BATCH_SIZE):
+            batch = pending[i : i + BATCH_SIZE]
+            file_ids = [item[0] for item in batch]
+            texts = [item[1] for item in batch]
+            try:
+                vectors = await _ollama.embed_batch(texts)
+            except ModelNotFoundError as exc:
+                return {
+                    "error": str(exc),
+                    "files_parsed": build_stats.get("files", 0),
+                    "symbols": build_stats.get("symbols", 0),
+                    "embeddings": embed_count,
+                }
+            if vectors is None:
+                logger.warning("Batch embedding failed for batch at index %d", i)
+                continue
+            for file_id, vec in zip(file_ids, vectors):
+                vector.upsert(file_id, EMBED_MODEL, vec)
+                embed_count += 1
+
+    return {
+        "files_parsed": build_stats.get("files", 0),
+        "symbols": build_stats.get("symbols", 0),
+        "errors": build_stats.get("errors", 0),
+        "embeddings": embed_count,
+        "embeddings_skipped": embed_skipped,
+        "model": EMBED_MODEL if not embed_skipped else None,
+    }
+
+
+@mcp.tool()
+def find_files(pattern: str) -> list[str]:
+    """
+    Search for files matching a glob pattern against the shallow index.
+
+    Args:
+        pattern: Glob pattern (e.g. "**/*.cs", "src/**/*.ts", "*.html").
+
+    Returns:
+        List of matching absolute file paths.
+    """
+    state = _require_project()
+    shallow: ShallowIndex = state["shallow"]
+    return shallow.find_files(pattern)
+
+
+@mcp.tool()
+def get_file_summary(path: str) -> dict:
+    """
+    Return the indexed summary for a file: symbols, imports, exports, line count.
+
+    Args:
+        path: Absolute or relative path to the file.
+
+    Returns:
+        Dict with path, language, line_count, imports, exports, symbols list.
+        Returns an error dict if the file is not indexed.
+    """
+    state = _require_project()
+    deep: DeepIndex = state["deep"]
+
+    expanded = os.path.expanduser(path)
+    if os.path.isabs(expanded):
+        abs_path = expanded
+    else:
+        abs_path = os.path.join(state["project_path"], expanded)
+    abs_path = os.path.normpath(abs_path)
+    summary = deep.get_file_summary(abs_path)
+    if summary is None:
+        return {"error": f"File not in index: {abs_path}. Run build_deep_index() first."}
+    return summary
+
+
+@mcp.tool()
+def get_symbol_body(file: str, symbol: str) -> str:
+    """
+    Retrieve the source code of a specific symbol (function, class, method, etc.).
+
+    IMPORTANT: The required parameters are named exactly `file` and `symbol`.
+    Do NOT use `path`, `file_path`, `symbol_name`, or any other names.
+
+    Args:
+        file: Absolute path to the source file. Example: "/path/to/MyClass.cs"
+        symbol: Short name only — NOT the qualified name. Examples: "HandleWopiRequest",
+                "CheckFileInfo", "MyClass". Do NOT include the class prefix.
+
+    Returns:
+        Source code of the symbol, or an error message if not found.
+    """
+    state = _require_project()
+    deep: DeepIndex = state["deep"]
+
+    expanded = os.path.expanduser(file)
+    if os.path.isabs(expanded):
+        abs_path = expanded
+    else:
+        abs_path = os.path.join(state["project_path"], expanded)
+    abs_path = os.path.normpath(abs_path)
+    body = deep.get_symbol_body(abs_path, symbol)
+    if body is None:
+        return f"Symbol '{symbol}' not found in {abs_path}. Ensure build_deep_index() has run."
+    return body
+
+
+@mcp.tool()
+def search_code(pattern: str, file_pattern: str = "*", max_results: int = 50) -> list[dict]:
+    """
+    Regex search across project files using ripgrep (or grep as fallback).
+
+    IMPORTANT: The required parameter is named exactly `pattern`, NOT `query` or `search`.
+
+    Args:
+        pattern: Regular expression or literal string to search for. Example: "SystemLevel|IsSystemLevel"
+        file_pattern: Glob to filter which files to search (e.g. "*.cs", "*Event*.cs", "**/*.ts").
+                      Default searches all supported files.
+        max_results: Maximum number of results to return. Default: 50.
+
+    Returns:
+        List of {"file": relative_path, "line": int, "match": str}.
+    """
+    state = _require_project()
+    return _grep_search_code(
+        state["project_path"],
+        pattern,
+        file_pattern=file_pattern,
+        max_results=max_results,
+    )
+
+
+@mcp.tool()
+async def semantic_search(query: str, top_k: int = 10) -> list[dict]:
+    """
+    Natural language semantic search using Ollama embeddings.
+
+    Embeds the query with the same model used during indexing, then returns
+    the most semantically similar files based on cosine similarity.
+
+    Args:
+        query: Natural language description (e.g. "authentication middleware",
+               "database connection pooling", "error handling for HTTP requests").
+        top_k: Number of results to return.
+
+    Returns:
+        List of {"file": path, "score": float, "language": str, "symbols": [...]}
+        sorted by relevance descending.
+    """
+    state = _require_project()
+    vector: VectorStore = state["vector"]
+    deep: DeepIndex = state["deep"]
+
+    if vector.get_count() == 0:
+        return [{"error": "No embeddings built. Run build_deep_index() first."}]
+
+    try:
+        query_vector = await _ollama.embed(query)
+    except ModelNotFoundError as exc:
+        return [{"error": str(exc)}]
+    if query_vector is None:
+        return [{"error": f"Ollama not available at {OLLAMA_BASE_URL}. Is `ollama serve` running?"}]
+
+    matches = vector.search(query_vector, top_k=top_k)
+
+    results = []
+    for match in matches:
+        file_path = match["file"]
+        score = match["score"]
+        summary = deep.get_file_summary(file_path)
+        symbol_names = []
+        language = ""
+        if summary:
+            language = summary.get("language", "")
+            symbol_names = [s["name"] for s in summary.get("symbols", [])[:10]]
+        results.append(
+            {
+                "file": file_path,
+                "score": round(score, 4),
+                "language": language,
+                "symbols": symbol_names,
+            }
+        )
+
+    return results
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
