@@ -18,6 +18,8 @@ from mcp.server.fastmcp import FastMCP
 
 from .constants import (
     DEEP_INDEX_DB_FILE,
+    EMBED_BATCH_SIZE,
+    EMBED_CONCURRENCY,
     EMBED_MODEL,
     OLLAMA_BASE_URL,
     SHALLOW_INDEX_FILE,
@@ -197,11 +199,9 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
         embed_skipped = True
     else:
         builder = deep.builder
-        BATCH_SIZE = 32
 
         # Symbol-level embeddings: find symbols without embeddings yet
         if force_rebuild:
-            # Wipe all symbol embeddings so they are regenerated
             deep.store_ref._conn().execute("DELETE FROM symbol_embeddings")
             deep.store_ref._conn().commit()
             symbols_needing_embed = deep.store_ref._conn().execute(
@@ -222,13 +222,11 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
             text = builder.build_symbol_embed_text(sym, sym["path"])
             pending.append((sym["symbol_id"], text))
 
-        # Send in batches
-        for i in range(0, len(pending), BATCH_SIZE):
-            batch = pending[i : i + BATCH_SIZE]
-            symbol_ids = [item[0] for item in batch]
-            texts = [item[1] for item in batch]
+        if pending:
+            symbol_ids = [p[0] for p in pending]
+            texts = [p[1] for p in pending]
             try:
-                vectors = await _ollama.embed_batch(texts)
+                vectors = await _ollama.embed_concurrent(texts, batch_size=EMBED_BATCH_SIZE, concurrency=EMBED_CONCURRENCY)
             except ModelNotFoundError as exc:
                 return {
                     "error": str(exc),
@@ -236,12 +234,11 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
                     "symbols": build_stats.get("symbols", 0),
                     "embeddings": embed_count,
                 }
-            if vectors is None:
-                logger.warning("Batch embedding failed for batch at index %d", i)
-                continue
-            for symbol_id, vec in zip(symbol_ids, vectors):
-                vector.upsert_symbol(symbol_id, EMBED_MODEL, vec)
-                embed_count += 1
+            if vectors:
+                for symbol_id, vec in zip(symbol_ids, vectors):
+                    if vec and vec != [0.0]:  # skip placeholder zero vectors from failed batches
+                        vector.upsert_symbol(symbol_id, EMBED_MODEL, vec)
+                        embed_count += 1
 
     return {
         "files_parsed": build_stats.get("files", 0),

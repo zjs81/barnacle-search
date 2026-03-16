@@ -29,5 +29,11 @@ DEEP_INDEX_DB_FILE = "index.db"
 OLLAMA_BASE_URL = "http://localhost:11434"
 EMBED_MODEL = "qwen3-embedding:0.6b"
 
+# Embedding concurrency: number of parallel requests sent to Ollama.
+# Requires OLLAMA_NUM_PARALLEL >= this value on the Ollama server.
+# Set OLLAMA_NUM_PARALLEL=4 in your environment before running `ollama serve`.
+EMBED_CONCURRENCY = 4
+EMBED_BATCH_SIZE = 8  # ≤8 avoids Ollama quality-degradation bug (issue #6262)
+
 DEBOUNCE_SECS = 0.5
 INDEX_MAX_WORKERS = max(1, int((os.cpu_count() or 4) * 0.75))

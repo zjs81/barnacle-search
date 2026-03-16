@@ -68,6 +68,16 @@ ollama pull qwen3-embedding:0.6b
 
 Barnacle will auto-pull the model if Ollama is running but the model isn't downloaded yet. Structural search (symbols, regex) works fine without Ollama.
 
+For faster indexing, set `OLLAMA_NUM_PARALLEL=4` before starting Ollama so it can handle concurrent embedding requests:
+
+```bash
+# macOS / Linux
+OLLAMA_NUM_PARALLEL=4 ollama serve
+
+# Windows PowerShell
+$env:OLLAMA_NUM_PARALLEL=4; ollama serve
+```
+
 ## Usage in Claude Code
 
 After setup, restart Claude Code. Then in any session:
