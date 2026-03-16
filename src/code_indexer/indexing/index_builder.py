@@ -168,7 +168,7 @@ class IndexBuilder:
 
     def build_embed_text(self, file_path: str, file_info: FileInfo) -> str:
         """
-        Build compact text summary for Ollama embedding.
+        Build compact text summary for Ollama embedding (file-level, legacy).
 
         Format:
           rel/path.cs [csharp]
@@ -189,5 +189,56 @@ class IndexBuilder:
         if file_info.imports:
             import_str = ", ".join(file_info.imports)
             lines.append(f"imports: {import_str}")
+
+        return "\n".join(lines)
+
+    def build_symbol_embed_text(self, sym: dict, file_path: str) -> str:
+        """
+        Build rich text for symbol-level embedding (improvement #2 + #4).
+
+        Includes file path, language, class hierarchy, signature, and body snippet
+        so the embedding captures both structural context and semantic content.
+
+        Format:
+          path/to/File.cs [csharp] > ParentClass > MethodName
+          signature: ParentClass.MethodName(int userId, string name)
+          <first 40 lines of body>
+        """
+        try:
+            rel = os.path.relpath(file_path, self.project_path).replace("\\", "/")
+        except ValueError:
+            rel = os.path.basename(file_path)
+
+        language = sym.get("language", "")
+        short_name = sym.get("short_name", "")
+        parent = sym.get("parent")
+        signature = sym.get("signature")
+
+        # Build breadcrumb: path [lang] > Parent > Name
+        breadcrumb = f"{rel} [{language}]"
+        if parent:
+            breadcrumb += f" > {parent} > {short_name}"
+        else:
+            breadcrumb += f" > {short_name}"
+
+        lines: list[str] = [breadcrumb]
+
+        if signature:
+            lines.append(f"signature: {signature}")
+
+        # Include up to 40 lines of the symbol body for semantic content
+        start_line = sym.get("line")
+        end_line = sym.get("end_line")
+        if start_line is not None:
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    all_lines = fh.readlines()
+                start_idx = start_line - 1
+                end_idx = min(end_line or start_line, start_line + 40)
+                body = "".join(all_lines[start_idx:end_idx]).strip()
+                if body:
+                    lines.append(body)
+            except OSError:
+                pass
 
         return "\n".join(lines)

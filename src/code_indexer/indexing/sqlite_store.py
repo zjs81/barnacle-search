@@ -2,10 +2,11 @@
 SQLite persistence layer for the deep index.
 
 Tables:
-  metadata   — key/value store (project_path, built_at, embed_model, etc.)
-  files      — one row per indexed file
-  symbols    — one row per extracted symbol
-  embeddings — one row per file (Ollama vector as packed float32 BLOB)
+  metadata          — key/value store (project_path, built_at, embed_model, etc.)
+  files             — one row per indexed file
+  symbols           — one row per extracted symbol
+  embeddings        — one row per file (Ollama vector as packed float32 BLOB)
+  symbol_embeddings — one row per symbol (Ollama vector as packed float32 BLOB)
 """
 
 import json
@@ -62,6 +63,15 @@ CREATE TABLE IF NOT EXISTS embeddings (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file_id);
+
+CREATE TABLE IF NOT EXISTS symbol_embeddings (
+    id         INTEGER PRIMARY KEY,
+    symbol_id  TEXT NOT NULL UNIQUE REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+    model      TEXT NOT NULL,
+    vector     BLOB NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_symbol ON symbol_embeddings(symbol_id);
 """
 
 
@@ -75,6 +85,22 @@ class SQLiteStore:
         # Initialize schema on the main thread
         conn = self._conn()
         conn.executescript(_CREATE_SQL)
+        conn.commit()
+        self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection):
+        """Apply any schema migrations needed for existing databases."""
+        # Add symbol_embeddings table if it doesn't exist (existing DBs pre-v2)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS symbol_embeddings (
+                id         INTEGER PRIMARY KEY,
+                symbol_id  TEXT NOT NULL UNIQUE REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+                model      TEXT NOT NULL,
+                vector     BLOB NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_symbol ON symbol_embeddings(symbol_id);
+        """)
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -244,6 +270,66 @@ class SQLiteStore:
 
     def get_embedding_count(self) -> int:
         return self._conn().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+
+    # ── Symbol Embeddings ────────────────────────────────────────────────────
+
+    def upsert_symbol_embedding(self, symbol_id: str, model: str, vector: list[float]):
+        blob = struct.pack(f"{len(vector)}f", *vector)
+        conn = self._conn()
+        conn.execute(
+            """
+            INSERT INTO symbol_embeddings(symbol_id, model, vector, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol_id) DO UPDATE SET
+                model      = excluded.model,
+                vector     = excluded.vector,
+                updated_at = excluded.updated_at
+            """,
+            (symbol_id, model, blob, time.time()),
+        )
+        conn.commit()
+
+    def get_all_symbol_embeddings(self) -> list[tuple[str, str, str, Optional[str], list[float]]]:
+        """Return list of (symbol_id, short_name, file_path, parent, vector) for all embedded symbols."""
+        rows = self._conn().execute(
+            """
+            SELECT se.symbol_id, s.short_name, f.path, s.parent, se.vector
+            FROM symbol_embeddings se
+            JOIN symbols s ON s.symbol_id = se.symbol_id
+            JOIN files f ON f.id = s.file_id
+            """
+        ).fetchall()
+        result = []
+        for row in rows:
+            blob = row["vector"]
+            dim = len(blob) // 4
+            vec = list(struct.unpack(f"{dim}f", blob))
+            result.append((row["symbol_id"], row["short_name"], row["path"], row["parent"], vec))
+        return result
+
+    def get_embedded_symbol_ids(self) -> set[str]:
+        """Return set of symbol_ids that already have embeddings."""
+        rows = self._conn().execute(
+            "SELECT symbol_id FROM symbol_embeddings"
+        ).fetchall()
+        return {r["symbol_id"] for r in rows}
+
+    def get_symbol_embedding_count(self) -> int:
+        return self._conn().execute("SELECT COUNT(*) FROM symbol_embeddings").fetchone()[0]
+
+    def get_symbols_needing_embedding(self) -> list[dict]:
+        """Return all symbols that do not yet have a symbol_embedding."""
+        rows = self._conn().execute(
+            """
+            SELECT s.symbol_id, s.short_name, s.parent, s.type, s.signature,
+                   s.line, s.end_line, f.path, f.language
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            LEFT JOIN symbol_embeddings se ON se.symbol_id = s.symbol_id
+            WHERE se.symbol_id IS NULL
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self):
         if hasattr(self._local, "conn") and self._local.conn:

@@ -30,14 +30,59 @@ class VectorStore:
         self.store = store
 
     def upsert(self, file_id: int, model: str, vector: list[float]):
-        """Store or update the embedding for a file."""
+        """Store or update the file-level embedding (legacy, kept for compatibility)."""
         self.store.upsert_embedding(file_id, model, vector)
+
+    def upsert_symbol(self, symbol_id: str, model: str, vector: list[float]):
+        """Store or update a symbol-level embedding."""
+        self.store.upsert_symbol_embedding(symbol_id, model, vector)
 
     def search(self, query_vector: list[float], top_k: int = 10) -> list[dict]:
         """
-        Find top-k most similar files using cosine similarity.
-        Returns list of {"file": path, "score": float} sorted by score descending.
+        Find top-k most similar symbols using cosine similarity, then group by file.
+
+        Returns list of {"file": path, "score": float, "matched_symbols": [...]}
+        sorted by best symbol score per file, descending.
         """
+        use_symbols = self.store.get_symbol_embedding_count() > 0
+        if use_symbols:
+            return self._search_symbols(query_vector, top_k)
+        return self._search_files(query_vector, top_k)
+
+    def _search_symbols(self, query_vector: list[float], top_k: int) -> list[dict]:
+        """Symbol-level search: score per symbol, dedupe to top files."""
+        query_dim = len(query_vector)
+        all_embeddings = self.store.get_all_symbol_embeddings()
+
+        # Score every symbol
+        symbol_scores: list[dict] = []
+        for symbol_id, short_name, file_path, parent, vector in all_embeddings:
+            if len(vector) != query_dim:
+                continue
+            score = cosine_similarity(query_vector, vector)
+            symbol_scores.append({
+                "symbol": short_name,
+                "file": file_path,
+                "score": score,
+            })
+
+        symbol_scores.sort(key=lambda x: x["score"], reverse=True)
+
+        # Group by file: keep best score per file + top matching symbols
+        seen_files: dict[str, dict] = {}
+        for s in symbol_scores:
+            fp = s["file"]
+            if fp not in seen_files:
+                seen_files[fp] = {"file": fp, "score": s["score"], "matched_symbols": []}
+            if len(seen_files[fp]["matched_symbols"]) < 5:
+                # symbol field is already "Parent.method" for methods, just "Name" for top-level
+                seen_files[fp]["matched_symbols"].append({"name": s["symbol"], "score": round(s["score"], 4)})
+
+        results = sorted(seen_files.values(), key=lambda x: x["score"], reverse=True)
+        return results[:top_k]
+
+    def _search_files(self, query_vector: list[float], top_k: int) -> list[dict]:
+        """File-level search fallback (used when no symbol embeddings exist)."""
         query_dim = len(query_vector)
         all_embeddings = self.store.get_all_embeddings()
 
@@ -46,16 +91,16 @@ class VectorStore:
             if len(vector) != query_dim:
                 logger.warning(
                     "Skipping embedding for '%s': dimension mismatch (expected %d, got %d)",
-                    file_path,
-                    query_dim,
-                    len(vector),
+                    file_path, query_dim, len(vector),
                 )
                 continue
             score = cosine_similarity(query_vector, vector)
-            results.append({"file": file_path, "score": score})
+            results.append({"file": file_path, "score": score, "matched_symbols": []})
 
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:top_k]
 
     def get_count(self) -> int:
-        return self.store.get_embedding_count()
+        """Return total embeddings (symbol-level if available, else file-level)."""
+        symbol_count = self.store.get_symbol_embedding_count()
+        return symbol_count if symbol_count > 0 else self.store.get_embedding_count()

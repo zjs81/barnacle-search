@@ -196,43 +196,36 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
         )
         embed_skipped = True
     else:
-        from .models.file_info import FileInfo
-
-        # Find files that don't have embeddings yet (or force_rebuild wipes all)
-        all_paths = deep.store_ref.get_all_file_paths()
-        if force_rebuild:
-            paths_needing_embed = all_paths
-        else:
-            embedded = deep.store_ref.get_embedded_paths()
-            paths_needing_embed = [p for p in all_paths if p not in embedded]
-
         builder = deep.builder
-        BATCH_SIZE = 32  # embed 32 files per API call
+        BATCH_SIZE = 32
 
-        # Build (file_id, embed_text) pairs
-        pending: list[tuple[int, str]] = []
-        for file_path in paths_needing_embed:
-            row = deep.store_ref.get_file(file_path)
-            if row is None:
-                continue
-            summary = deep.get_file_summary(file_path)
-            if summary is None:
-                continue
-            fi = FileInfo(
-                path=file_path,
-                language=row["language"] or "",
-                line_count=row["line_count"] or 0,
-                mtime=row["mtime"] or 0.0,
-                imports=summary.get("imports", []),
-                exports=summary.get("exports", []),
-            )
-            text = builder.build_embed_text(file_path, fi)
-            pending.append((row["id"], text))
+        # Symbol-level embeddings: find symbols without embeddings yet
+        if force_rebuild:
+            # Wipe all symbol embeddings so they are regenerated
+            deep.store_ref._conn().execute("DELETE FROM symbol_embeddings")
+            deep.store_ref._conn().commit()
+            symbols_needing_embed = deep.store_ref._conn().execute(
+                """
+                SELECT s.symbol_id, s.short_name, s.parent, s.type, s.signature,
+                       s.line, s.end_line, f.path, f.language
+                FROM symbols s
+                JOIN files f ON f.id = s.file_id
+                """
+            ).fetchall()
+            symbols_needing_embed = [dict(r) for r in symbols_needing_embed]
+        else:
+            symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
+
+        # Build (symbol_id, embed_text) pairs
+        pending: list[tuple[str, str]] = []
+        for sym in symbols_needing_embed:
+            text = builder.build_symbol_embed_text(sym, sym["path"])
+            pending.append((sym["symbol_id"], text))
 
         # Send in batches
         for i in range(0, len(pending), BATCH_SIZE):
             batch = pending[i : i + BATCH_SIZE]
-            file_ids = [item[0] for item in batch]
+            symbol_ids = [item[0] for item in batch]
             texts = [item[1] for item in batch]
             try:
                 vectors = await _ollama.embed_batch(texts)
@@ -246,8 +239,8 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
             if vectors is None:
                 logger.warning("Batch embedding failed for batch at index %d", i)
                 continue
-            for file_id, vec in zip(file_ids, vectors):
-                vector.upsert(file_id, EMBED_MODEL, vec)
+            for symbol_id, vec in zip(symbol_ids, vectors):
+                vector.upsert_symbol(symbol_id, EMBED_MODEL, vec)
                 embed_count += 1
 
     return {
@@ -396,18 +389,15 @@ async def semantic_search(query: str, top_k: int = 10) -> list[dict]:
     for match in matches:
         file_path = match["file"]
         score = match["score"]
+        matched_symbols = match.get("matched_symbols", [])
         summary = deep.get_file_summary(file_path)
-        symbol_names = []
-        language = ""
-        if summary:
-            language = summary.get("language", "")
-            symbol_names = [s["name"] for s in summary.get("symbols", [])[:10]]
+        language = summary.get("language", "") if summary else ""
         results.append(
             {
                 "file": file_path,
                 "score": round(score, 4),
                 "language": language,
-                "symbols": symbol_names,
+                "matched_symbols": matched_symbols,
             }
         )
 
