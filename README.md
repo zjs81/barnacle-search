@@ -121,8 +121,22 @@ Barnacle uses a two-tier index:
 2. **Deep index** — a SQLite database with three tables:
    - `files` — path, language, line count, imports, exports
    - `symbols` — extracted classes/methods/functions with line ranges
-   - `embeddings` — packed float32 vectors (no numpy/chromadb needed)
+   - `symbol_embeddings` — one vector per symbol (packed float32 BLOB, no numpy/chromadb needed)
 
-The file watcher uses FSEventsObserver on macOS and inotify on Linux — directory-level watching with a 500ms debounce, so large repos with `node_modules` work fine.
+### Symbol-level embeddings
 
-Embeddings are stored as raw `struct`-packed float32 BLOBs in SQLite alongside the symbol data. Cosine similarity search is pure Python — sufficient for thousands of files without needing a vector database.
+Embeddings are generated per symbol (class, method, function), not per file. Each symbol is embedded with its full context:
+
+```
+path/to/File.cs [csharp] > ClassName > MethodName
+signature: ClassName.MethodName(int userId, string name)
+<up to 40 lines of body>
+```
+
+This means `semantic_search("password hashing")` returns `PasswordHasher.Hash()` directly instead of a file that happens to contain it somewhere. `semantic_search` results include a `matched_symbols` list showing which specific symbols scored highest and their individual scores.
+
+A large repo with 1,000 files and 30 symbols per file produces ~30,000 embeddings — all stored in SQLite, searched with pure Python cosine similarity. No vector database needed at this scale.
+
+### File watcher
+
+Uses FSEventsObserver on macOS and inotify on Linux — directory-level watching with a 500ms debounce, so large repos with `node_modules` work fine. Changed files are re-parsed and their symbol embeddings regenerated incrementally.
