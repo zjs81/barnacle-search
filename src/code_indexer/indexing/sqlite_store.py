@@ -170,6 +170,11 @@ class SQLiteStore:
         rows = self._conn().execute("SELECT path FROM files").fetchall()
         return [r["path"] for r in rows]
 
+    def get_all_files_with_mtime(self) -> list[dict]:
+        """Return [{path, mtime}] for all indexed files."""
+        rows = self._conn().execute("SELECT path, mtime FROM files").fetchall()
+        return [dict(r) for r in rows]
+
     def get_file_count(self) -> int:
         return self._conn().execute("SELECT COUNT(*) FROM files").fetchone()[0]
 

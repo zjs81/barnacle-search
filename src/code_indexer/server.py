@@ -82,6 +82,30 @@ def _rebuild_callback(file_path: str):
         pass
 
 
+async def _sync_stale_files():
+    """Re-parse files that changed while the server was offline, then embed pending symbols."""
+    state = _state
+    if state["deep"] is None:
+        return
+
+    stored = state["deep"].store_ref.get_all_files_with_mtime()
+    for row in stored:
+        path = row["path"]
+        stored_mtime = row["mtime"]
+        try:
+            current_mtime = os.stat(path).st_mtime
+        except OSError:
+            # File was deleted — remove it from the index
+            logger.info("Removing deleted file from index: %s", path)
+            state["deep"].store_ref.delete_file(path)
+            continue
+        if stored_mtime is None or current_mtime > stored_mtime:
+            logger.info("Re-parsing stale file: %s", path)
+            state["deep"].rebuild_file(path)
+
+    await _embed_pending()
+
+
 async def _embed_pending():
     """Embed any symbols that don't have vectors yet."""
     state = _state
@@ -192,8 +216,8 @@ async def set_project_path(path: str) -> str:
     # Start watcher
     _watcher.start(abs_path, _rebuild_callback)
 
-    # Embed any symbols that don't have vectors yet (picks up delta from offline changes)
-    asyncio.ensure_future(_embed_pending())
+    # Sync files that changed while the server was offline
+    asyncio.ensure_future(_sync_stale_files())
 
     stats = shallow.get_stats()
     lang_summary = ", ".join(
