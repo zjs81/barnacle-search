@@ -4,7 +4,7 @@ A local MCP server that attaches to your codebase and gives Claude semantic sear
 
 ## What it does
 
-- **Symbol extraction** — parses every file with tree-sitter and indexes classes, methods, functions, imports
+- **Symbol extraction** — parses every file with tree-sitter and indexes classes, methods, and functions
 - **Semantic search** — embeds your codebase with a local Ollama model so you can search by meaning, not just text
 - **Regex search** — fast ripgrep/grep fallback for exact pattern matching
 - **Auto-reindex** — watches for file changes and updates the index automatically
@@ -68,16 +68,6 @@ ollama pull qwen3-embedding:0.6b
 
 Barnacle will auto-pull the model if Ollama is running but the model isn't downloaded yet. Structural search (symbols, regex) works fine without Ollama.
 
-For faster indexing, set `OLLAMA_NUM_PARALLEL=4` before starting Ollama so it can handle concurrent embedding requests:
-
-```bash
-# macOS / Linux
-OLLAMA_NUM_PARALLEL=4 ollama serve
-
-# Windows PowerShell
-$env:OLLAMA_NUM_PARALLEL=4; ollama serve
-```
-
 ## Usage in Claude Code
 
 After setup, restart Claude Code. Then in any session:
@@ -128,10 +118,11 @@ build_deep_index()
 Barnacle uses a two-tier index:
 
 1. **Shallow index** — a lightweight JSON file list with mtimes for fast file lookup without touching the database
-2. **Deep index** — a SQLite database with three tables:
+2. **Deep index** — a SQLite database with four tables:
    - `files` — path, language, line count, imports, exports
    - `symbols` — extracted classes/methods/functions with line ranges
    - `symbol_embeddings` — one vector per symbol (packed float32 BLOB, no numpy/chromadb needed)
+   - `symbol_fts` — FTS5 full-text index over symbol names, signatures, and file paths
 
 ### Symbol-level embeddings
 
@@ -145,7 +136,20 @@ signature: ClassName.MethodName(int userId, string name)
 
 This means `semantic_search("password hashing")` returns `PasswordHasher.Hash()` directly instead of a file that happens to contain it somewhere. `semantic_search` results include a `matched_symbols` list showing which specific symbols scored highest and their individual scores.
 
-A large repo with 1,000 files and 30 symbols per file produces ~30,000 embeddings — all stored in SQLite, searched with pure Python cosine similarity. No vector database needed at this scale.
+Not every symbol gets embedded — imports and trivial methods/functions (≤2 lines) are filtered out as noise. This typically cuts embedding count by 20-40% on real codebases while keeping all the symbols worth searching for.
+
+Embed text is capped at 2000 characters to prevent context overflow errors on unusually large methods. Symbols are sent to Ollama in batches of 64 for throughput. A large codebase (~28k symbols after filtering) typically indexes in 5-6 minutes.
+
+### Hybrid search
+
+`semantic_search` combines two signals to rank results:
+
+1. **Cosine similarity** (70%) — embedding distance between your query and each symbol
+2. **BM25 keyword match** (30%) — SQLite FTS5 full-text search over symbol names, signatures, and file paths
+
+Both scores are normalized to 0–1 before blending, so neither dominates by magnitude. The result is that queries like `"retry logic"` surface symbols whose *meaning* is close even if the word "retry" doesn't appear, while exact-name queries like `"RetryService"` get a strong keyword boost that pulls the right symbol to the top.
+
+Embeddings are stored in SQLite as packed float32 BLOBs. No vector database needed at this scale.
 
 ### File watcher
 

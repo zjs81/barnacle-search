@@ -25,3 +25,8 @@ barnacle-search = "code_indexer.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/code_indexer"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

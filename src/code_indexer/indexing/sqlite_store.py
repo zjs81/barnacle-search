@@ -62,6 +62,26 @@ CREATE TABLE IF NOT EXISTS symbol_embeddings (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_symbol ON symbol_embeddings(symbol_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
+    symbol_id UNINDEXED,
+    file_path,
+    short_name,
+    parent,
+    signature,
+    tokenize='unicode61'
+);
+"""
+
+_MIGRATE_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
+    symbol_id UNINDEXED,
+    file_path,
+    short_name,
+    parent,
+    signature,
+    tokenize='unicode61'
+);
 """
 
 
@@ -75,6 +95,8 @@ class SQLiteStore:
         # Initialize schema on the main thread
         conn = self._conn()
         conn.executescript(_CREATE_SQL)
+        # Migrate existing DBs that predate symbol_fts
+        conn.executescript(_MIGRATE_SQL)
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -133,6 +155,8 @@ class SQLiteStore:
 
     def delete_file(self, path: str):
         conn = self._conn()
+        # Remove FTS entries for this file before CASCADE deletes the symbols
+        conn.execute("DELETE FROM symbol_fts WHERE file_path=?", (path,))
         conn.execute("DELETE FROM files WHERE path=?", (path,))
         conn.commit()
 
@@ -161,6 +185,10 @@ class SQLiteStore:
         if not symbols:
             return
         conn = self._conn()
+        # Get file path for FTS population
+        file_row = conn.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
+        file_path = file_row["path"] if file_row else ""
+
         conn.executemany(
             """
             INSERT OR IGNORE INTO symbols
@@ -172,6 +200,17 @@ class SQLiteStore:
                     s.symbol_id, file_id, s.type, s.name,
                     s.parent, s.line, s.end_line, s.signature,
                 )
+                for s in symbols
+            ],
+        )
+        # Populate FTS index (INSERT OR IGNORE — won't re-add duplicates)
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (s.symbol_id, file_path, s.name or "", s.parent or "", s.signature or "")
                 for s in symbols
             ],
         )
@@ -200,6 +239,35 @@ class SQLiteStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def fts_search(self, query: str) -> list[tuple[str, float]]:
+        """
+        Full-text search over symbol names, signatures, and file paths.
+        Returns list of (symbol_id, bm25_score) sorted by relevance descending.
+        BM25 scores from SQLite are negative (more negative = better match),
+        so we negate them to get positive scores.
+        """
+        # Sanitize query: FTS5 treats some chars as operators
+        safe_query = " ".join(
+            word for word in query.split()
+            if word and not word.startswith(("-", "+", "^", '"', "*"))
+        )
+        if not safe_query:
+            return []
+        try:
+            rows = self._conn().execute(
+                """
+                SELECT symbol_id, -bm25(symbol_fts) AS score
+                FROM symbol_fts
+                WHERE symbol_fts MATCH ?
+                ORDER BY score DESC
+                LIMIT 200
+                """,
+                (safe_query,),
+            ).fetchall()
+            return [(r["symbol_id"], float(r["score"])) for r in rows]
+        except Exception:
+            return []
+
     # ── Symbol Embeddings ────────────────────────────────────────────────────
 
     def upsert_symbol_embedding(self, symbol_id: str, model: str, vector: list[float]):
@@ -215,6 +283,25 @@ class SQLiteStore:
                 updated_at = excluded.updated_at
             """,
             (symbol_id, model, blob, time.time()),
+        )
+        conn.commit()
+
+    def bulk_upsert_symbol_embeddings(self, rows: list[tuple[str, str, list[float]]]):
+        """Upsert many (symbol_id, model, vector) rows in a single transaction."""
+        if not rows:
+            return
+        now = time.time()
+        conn = self._conn()
+        conn.executemany(
+            """
+            INSERT INTO symbol_embeddings(symbol_id, model, vector, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol_id) DO UPDATE SET
+                model      = excluded.model,
+                vector     = excluded.vector,
+                updated_at = excluded.updated_at
+            """,
+            [(sym_id, model, struct.pack(f"{len(vec)}f", *vec), now) for sym_id, model, vec in rows],
         )
         conn.commit()
 

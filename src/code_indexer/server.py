@@ -19,7 +19,6 @@ from mcp.server.fastmcp import FastMCP
 from .constants import (
     DEEP_INDEX_DB_FILE,
     EMBED_BATCH_SIZE,
-    EMBED_CONCURRENCY,
     EMBED_MODEL,
     OLLAMA_BASE_URL,
     SHALLOW_INDEX_FILE,
@@ -73,6 +72,23 @@ def _rebuild_callback(file_path: str):
         return
     logger.info("Auto-reindexing: %s", file_path)
     state["deep"].rebuild_file(file_path)
+
+
+# ── Embedding filter ──────────────────────────────────────────────────────────
+
+def _skip_embedding(sym: dict) -> bool:
+    """Return True for symbols not worth embedding."""
+    sym_type = sym.get("type", "")
+    # Imports carry no semantic search value
+    if sym_type == "import":
+        return True
+    # Trivial methods/functions only (not classes — even empty DTOs/interfaces are searchable)
+    if sym_type in ("method", "function"):
+        start = sym.get("line") or 0
+        end = sym.get("end_line") or 0
+        if end - start <= 2:
+            return True
+    return False
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────
@@ -216,17 +232,33 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
         else:
             symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
 
-        # Build (symbol_id, embed_text) pairs
+        # Build (symbol_id, embed_text) pairs, skipping low-value symbols.
+        # Cache file lines per path to avoid re-reading the same file for each symbol.
         pending: list[tuple[str, str]] = []
+        skipped = 0
+        file_lines_cache: dict[str, list[str]] = {}
         for sym in symbols_needing_embed:
-            text = builder.build_symbol_embed_text(sym, sym["path"])
+            if _skip_embedding(sym):
+                skipped += 1
+                continue
+            fp = sym["path"]
+            if fp not in file_lines_cache:
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+                        file_lines_cache[fp] = fh.readlines()
+                except OSError:
+                    file_lines_cache[fp] = []
+            text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
             pending.append((sym["symbol_id"], text))
+        if skipped:
+            logger.info("Skipped %d low-value symbols (imports, trivial 1-2 liners)", skipped)
 
-        if pending:
-            symbol_ids = [p[0] for p in pending]
-            texts = [p[1] for p in pending]
+        for i in range(0, len(pending), EMBED_BATCH_SIZE):
+            batch = pending[i : i + EMBED_BATCH_SIZE]
+            symbol_ids = [p[0] for p in batch]
+            texts = [p[1] for p in batch]
             try:
-                vectors = await _ollama.embed_concurrent(texts, batch_size=EMBED_BATCH_SIZE, concurrency=EMBED_CONCURRENCY)
+                vectors = await _ollama.embed_batch(texts)
             except ModelNotFoundError as exc:
                 return {
                     "error": str(exc),
@@ -235,10 +267,8 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
                     "embeddings": embed_count,
                 }
             if vectors:
-                for symbol_id, vec in zip(symbol_ids, vectors):
-                    if vec and vec != [0.0]:  # skip placeholder zero vectors from failed batches
-                        vector.upsert_symbol(symbol_id, EMBED_MODEL, vec)
-                        embed_count += 1
+                vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+                embed_count += len(vectors)
 
     return {
         "files_parsed": build_stats.get("files", 0),
@@ -380,7 +410,7 @@ async def semantic_search(query: str, top_k: int = 10) -> list[dict]:
     if query_vector is None:
         return [{"error": f"Ollama not available at {OLLAMA_BASE_URL}. Is `ollama serve` running?"}]
 
-    matches = vector.search(query_vector, top_k=top_k)
+    matches = vector.search(query_vector, top_k=top_k, query_text=query)
 
     results = []
     for match in matches:

@@ -71,50 +71,6 @@ class OllamaClient:
             logger.error("Ollama pull unexpected error: %s", exc)
             return False
 
-    async def embed_concurrent(
-        self,
-        texts: list[str],
-        batch_size: int = 8,
-        concurrency: int = 4,
-    ) -> Optional[list[list[float]]]:
-        """
-        Embed a large list of texts using small concurrent batches.
-
-        Sends `concurrency` requests in parallel, each with `batch_size` inputs.
-        - batch_size ≤ 8 avoids Ollama's quality-degradation bug (issue #6262)
-        - concurrency requires OLLAMA_NUM_PARALLEL ≥ concurrency on the Ollama server
-
-        Returns list of vectors in same order as input, or raises ModelNotFoundError.
-        """
-        import asyncio
-
-        if not texts:
-            return []
-
-        # Split into small batches
-        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
-        results: list[Optional[list[list[float]]]] = [None] * len(batches)
-
-        # Process with a semaphore to cap concurrency
-        sem = asyncio.Semaphore(concurrency)
-
-        async def _do_batch(idx: int, batch: list[str]):
-            async with sem:
-                results[idx] = await self.embed_batch(batch)
-
-        await asyncio.gather(*[_do_batch(i, b) for i, b in enumerate(batches)])
-
-        # Flatten in order
-        out: list[list[float]] = []
-        for i, vecs in enumerate(results):
-            if vecs is None:
-                logger.warning("Batch %d failed — embedding quality may be incomplete", i)
-                # Insert zero vectors as placeholders to preserve index alignment
-                out.extend([[0.0]] * len(batches[i]))
-            else:
-                out.extend(vecs)
-        return out
-
     async def embed_batch(self, texts: list[str], _retry: bool = True) -> Optional[list[list[float]]]:
         """
         Generate embeddings for multiple texts in a single API call.

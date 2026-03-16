@@ -192,17 +192,21 @@ class IndexBuilder:
 
         return "\n".join(lines)
 
-    def build_symbol_embed_text(self, sym: dict, file_path: str) -> str:
+    def build_symbol_embed_text(self, sym: dict, file_path: str,
+                                file_lines: Optional[list[str]] = None) -> str:
         """
-        Build rich text for symbol-level embedding (improvement #2 + #4).
+        Build rich text for symbol-level embedding.
 
-        Includes file path, language, class hierarchy, signature, and body snippet
-        so the embedding captures both structural context and semantic content.
+        Args:
+            sym: Symbol dict with short_name, parent, language, signature, line, end_line.
+            file_path: Absolute path to the source file.
+            file_lines: Pre-loaded lines of the file (avoids re-reading disk).
+                        If None, the file is read from disk.
 
         Format:
           path/to/File.cs [csharp] > ParentClass > MethodName
           signature: ParentClass.MethodName(int userId, string name)
-          <first 40 lines of body>
+          <first 40 lines of body, capped at 2000 chars>
         """
         try:
             rel = os.path.relpath(file_path, self.project_path).replace("\\", "/")
@@ -226,16 +230,18 @@ class IndexBuilder:
         if signature:
             lines.append(f"signature: {signature}")
 
-        # Include up to 40 lines of the symbol body for semantic content
+        # Include up to 40 lines of the symbol body for semantic content,
+        # capped at 2000 chars to avoid context length errors on giant methods
         start_line = sym.get("line")
         end_line = sym.get("end_line")
         if start_line is not None:
             try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
-                    all_lines = fh.readlines()
+                if file_lines is None:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        file_lines = fh.readlines()
                 start_idx = start_line - 1
                 end_idx = min(end_line or start_line, start_line + 40)
-                body = "".join(all_lines[start_idx:end_idx]).strip()
+                body = "".join(file_lines[start_idx:end_idx]).strip()[:2000]
                 if body:
                     lines.append(body)
             except OSError:
