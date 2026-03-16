@@ -148,7 +148,7 @@ mcp = FastMCP("barnacle-search")
 
 
 @mcp.tool()
-def set_project_path(path: str) -> str:
+async def set_project_path(path: str) -> str:
     """
     Set the project root directory to index.
 
@@ -191,6 +191,9 @@ def set_project_path(path: str) -> str:
 
     # Start watcher
     _watcher.start(abs_path, _rebuild_callback)
+
+    # Embed any symbols that don't have vectors yet (picks up delta from offline changes)
+    asyncio.ensure_future(_embed_pending())
 
     stats = shallow.get_stats()
     lang_summary = ", ".join(
