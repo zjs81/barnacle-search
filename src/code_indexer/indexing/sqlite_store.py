@@ -5,7 +5,6 @@ Tables:
   metadata          — key/value store (project_path, built_at, embed_model, etc.)
   files             — one row per indexed file
   symbols           — one row per extracted symbol
-  embeddings        — one row per file (Ollama vector as packed float32 BLOB)
   symbol_embeddings — one row per symbol (Ollama vector as packed float32 BLOB)
 """
 
@@ -55,15 +54,6 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file       ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_short_name ON symbols(short_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_type       ON symbols(type);
 
-CREATE TABLE IF NOT EXISTS embeddings (
-    id         INTEGER PRIMARY KEY,
-    file_id    INTEGER NOT NULL UNIQUE REFERENCES files(id) ON DELETE CASCADE,
-    model      TEXT NOT NULL,
-    vector     BLOB NOT NULL,
-    updated_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file_id);
-
 CREATE TABLE IF NOT EXISTS symbol_embeddings (
     id         INTEGER PRIMARY KEY,
     symbol_id  TEXT NOT NULL UNIQUE REFERENCES symbols(symbol_id) ON DELETE CASCADE,
@@ -85,22 +75,6 @@ class SQLiteStore:
         # Initialize schema on the main thread
         conn = self._conn()
         conn.executescript(_CREATE_SQL)
-        conn.commit()
-        self._migrate(conn)
-
-    def _migrate(self, conn: sqlite3.Connection):
-        """Apply any schema migrations needed for existing databases."""
-        # Add symbol_embeddings table if it doesn't exist (existing DBs pre-v2)
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS symbol_embeddings (
-                id         INTEGER PRIMARY KEY,
-                symbol_id  TEXT NOT NULL UNIQUE REFERENCES symbols(symbol_id) ON DELETE CASCADE,
-                model      TEXT NOT NULL,
-                vector     BLOB NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_symbol ON symbol_embeddings(symbol_id);
-        """)
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -225,51 +199,6 @@ class SQLiteStore:
             "SELECT * FROM symbols WHERE short_name=?", (name,)
         ).fetchall()
         return [dict(r) for r in rows]
-
-    # ── Embeddings ───────────────────────────────────────────────────────────
-
-    def upsert_embedding(self, file_id: int, model: str, vector: list[float]):
-        blob = struct.pack(f"{len(vector)}f", *vector)
-        conn = self._conn()
-        conn.execute(
-            """
-            INSERT INTO embeddings(file_id, model, vector, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(file_id) DO UPDATE SET
-                model      = excluded.model,
-                vector     = excluded.vector,
-                updated_at = excluded.updated_at
-            """,
-            (file_id, model, blob, time.time()),
-        )
-        conn.commit()
-
-    def get_all_embeddings(self) -> list[tuple[str, list[float]]]:
-        """Return list of (file_path, vector) for all embedded files."""
-        rows = self._conn().execute(
-            """
-            SELECT f.path, e.vector
-            FROM embeddings e
-            JOIN files f ON f.id = e.file_id
-            """
-        ).fetchall()
-        result = []
-        for row in rows:
-            blob = row["vector"]
-            dim = len(blob) // 4
-            vec = list(struct.unpack(f"{dim}f", blob))
-            result.append((row["path"], vec))
-        return result
-
-    def get_embedded_paths(self) -> set[str]:
-        """Return set of file paths that already have embeddings (no vector data loaded)."""
-        rows = self._conn().execute(
-            "SELECT f.path FROM embeddings e JOIN files f ON f.id = e.file_id"
-        ).fetchall()
-        return {r["path"] for r in rows}
-
-    def get_embedding_count(self) -> int:
-        return self._conn().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
 
     # ── Symbol Embeddings ────────────────────────────────────────────────────
 
