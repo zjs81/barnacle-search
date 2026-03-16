@@ -7,6 +7,7 @@ Exposes 8 tools over stdio:
   search_code, semantic_search
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -72,6 +73,56 @@ def _rebuild_callback(file_path: str):
         return
     logger.info("Auto-reindexing: %s", file_path)
     state["deep"].rebuild_file(file_path)
+    # Schedule embedding for new symbols in the background
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_embed_pending())
+    except RuntimeError:
+        pass
+
+
+async def _embed_pending():
+    """Embed any symbols that don't have vectors yet."""
+    state = _state
+    if state["deep"] is None or state["vector"] is None:
+        return
+
+    ollama_ok = await _ollama.is_available()
+    if not ollama_ok:
+        return
+
+    symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
+    if not symbols_needing_embed:
+        return
+
+    builder = state["deep"].builder
+    pending: list[tuple[str, str]] = []
+    file_lines_cache: dict[str, list[str]] = {}
+    for sym in symbols_needing_embed:
+        if _skip_embedding(sym):
+            continue
+        fp = sym["path"]
+        if fp not in file_lines_cache:
+            try:
+                with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+                    file_lines_cache[fp] = fh.readlines()
+            except OSError:
+                file_lines_cache[fp] = []
+        text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
+        pending.append((sym["symbol_id"], text))
+
+    for i in range(0, len(pending), EMBED_BATCH_SIZE):
+        batch = pending[i : i + EMBED_BATCH_SIZE]
+        symbol_ids = [p[0] for p in batch]
+        texts = [p[1] for p in batch]
+        try:
+            vectors = await _ollama.embed_batch(texts)
+        except ModelNotFoundError:
+            return
+        if vectors:
+            state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+    logger.info("Auto-embedded %d new symbols", len(pending))
 
 
 # ── Embedding filter ──────────────────────────────────────────────────────────
