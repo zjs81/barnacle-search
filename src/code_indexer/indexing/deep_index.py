@@ -246,7 +246,7 @@ class DeepIndex:
         return {
             "files": self.store.get_file_count(),
             "symbols": symbol_count,
-            "embeddings": self.store.get_embedding_count(),
+            "embeddings": self.store.get_symbol_embedding_count(),
             "built_at": self.store.get_meta("built_at"),
             "project_path": self.store.get_meta("project_path"),
         }

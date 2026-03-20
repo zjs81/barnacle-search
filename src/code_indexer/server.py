@@ -275,6 +275,10 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
     deep: DeepIndex = state["deep"]
     vector: VectorStore = state["vector"]
 
+    # Stop file watcher during build to prevent concurrent DB writes
+    # (watcher runs in a background thread and can race with the build)
+    _watcher.stop()
+
     # Phase 1: parse all files
     build_stats = deep.build(force_rebuild=force_rebuild)
 
@@ -347,6 +351,9 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
             if vectors:
                 vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
                 embed_count += len(vectors)
+
+    # Restart file watcher
+    _watcher.start(state["project_path"], _rebuild_callback)
 
     return {
         "files_parsed": build_stats.get("files", 0),
