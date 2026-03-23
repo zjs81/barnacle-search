@@ -38,8 +38,7 @@ class DeepIndex:
         """
         if force_rebuild:
             # Wipe existing file records; CASCADE removes symbols + embeddings
-            for path in self.store.get_all_file_paths():
-                self.store.delete_file(path)
+            self.store.clear_files()
             return self.builder.build_all()
 
         # Incremental: collect candidate files, skip unchanged ones
@@ -101,11 +100,10 @@ class DeepIndex:
                 if file_info.error:
                     total_errors += 1
 
-                # Delete stale record then re-insert
-                self.store.delete_file(fp)
                 try:
-                    file_id = self.store.upsert_file(file_info)
-                    self.store.insert_symbols(file_id, symbols)
+                    self.store.persist_file_and_symbols(
+                        file_info, symbols, replace_existing=True
+                    )
                 except Exception as exc:
                     log.warning("DB write failed for %s: %s", fp, exc)
                     total_errors += 1

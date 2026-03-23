@@ -5,6 +5,7 @@ Supports parallel processing via ThreadPoolExecutor.
 
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,6 +20,9 @@ if TYPE_CHECKING:
     from ..indexing.strategies.base import ParsingStrategy  # noqa: F401
 
 log = logging.getLogger(__name__)
+
+_EMBED_BODY_MAX_TOKENS = 510
+_TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
 class IndexBuilder:
@@ -65,8 +69,7 @@ class IndexBuilder:
                     total_errors += 1
 
                 try:
-                    file_id = self.store.upsert_file(file_info)
-                    self.store.insert_symbols(file_id, symbols)
+                    self.store.persist_file_and_symbols(file_info, symbols)
                 except Exception as exc:
                     log.warning("DB write failed for %s: %s", fp, exc)
                     total_errors += 1
@@ -99,8 +102,9 @@ class IndexBuilder:
 
         # Step 3: persist
         try:
-            file_id = self.store.upsert_file(file_info)
-            self.store.insert_symbols(file_id, symbols)
+            self.store.persist_file_and_symbols(
+                file_info, symbols, replace_existing=True
+            )
         except Exception as exc:
             log.warning("DB write failed for %s: %s", file_path, exc)
             return False
@@ -128,6 +132,7 @@ class IndexBuilder:
 
         try:
             file_info = strategy.parse_file(file_path, content)
+            self._populate_symbol_bodies(file_info.symbols, content.splitlines())
         except Exception as exc:
             log.warning("Parse error for %s: %s", file_path, exc)
             # Build a minimal FileInfo so the file is still recorded
@@ -206,7 +211,7 @@ class IndexBuilder:
         Format:
           path/to/File.cs [csharp] > ParentClass > MethodName
           signature: ParentClass.MethodName(int userId, string name)
-          <first 40 lines of body, capped at 2000 chars>
+          <symbol body capped to 510 tokens>
         """
         try:
             rel = os.path.relpath(file_path, self.project_path).replace("\\", "/")
@@ -230,8 +235,8 @@ class IndexBuilder:
         if signature:
             lines.append(f"signature: {signature}")
 
-        # Include up to 40 lines of the symbol body for semantic content,
-        # capped at 2000 chars to avoid context length errors on giant methods
+        # Include the symbol body for semantic content, capped to roughly
+        # 510 tokens so giant methods do not dominate embedding latency.
         start_line = sym.get("line")
         end_line = sym.get("end_line")
         if start_line is not None:
@@ -240,11 +245,38 @@ class IndexBuilder:
                     with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
                         file_lines = fh.readlines()
                 start_idx = start_line - 1
-                end_idx = min(end_line or start_line, start_line + 40)
-                body = "".join(file_lines[start_idx:end_idx]).strip()[:2000]
+                end_idx = end_line or start_line
+                body = "".join(file_lines[start_idx:end_idx]).strip()
+                body = self._truncate_body_tokens(body, _EMBED_BODY_MAX_TOKENS)
                 if body:
                     lines.append(body)
             except OSError:
                 pass
 
         return "\n".join(lines)
+
+    def _truncate_body_tokens(self, text: str, max_tokens: int) -> str:
+        if not text or max_tokens <= 0:
+            return ""
+
+        tokens = list(_TOKEN_RE.finditer(text))
+        if len(tokens) <= max_tokens:
+            return text
+
+        cutoff = tokens[max_tokens].start()
+        return text[:cutoff].rstrip()
+
+    def _populate_symbol_bodies(self, symbols: list[SymbolInfo], file_lines: list[str]) -> None:
+        for symbol in symbols:
+            start_line = symbol.line
+            end_line = symbol.end_line or start_line
+            if start_line is None or start_line <= 0:
+                symbol.body_text = None
+                continue
+            start_idx = start_line - 1
+            end_idx = min(len(file_lines), end_line)
+            if start_idx >= len(file_lines) or start_idx < 0 or end_idx <= start_idx:
+                symbol.body_text = None
+                continue
+            body = "\n".join(file_lines[start_idx:end_idx]).strip()
+            symbol.body_text = self._truncate_body_tokens(body, _EMBED_BODY_MAX_TOKENS)

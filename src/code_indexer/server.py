@@ -8,6 +8,7 @@ Exposes 8 tools over stdio:
 """
 
 import asyncio
+import collections
 import hashlib
 import logging
 import os
@@ -123,8 +124,12 @@ async def _embed_pending():
     builder = state["deep"].builder
     pending: list[tuple[str, str]] = []
     file_lines_cache: dict[str, list[str]] = {}
+    pending_by_type: collections.Counter[str] = collections.Counter()
+    skipped_by_reason: collections.Counter[str] = collections.Counter()
     for sym in symbols_needing_embed:
-        if _skip_embedding(sym):
+        skip_reason = _skip_embedding_reason(sym)
+        if skip_reason:
+            skipped_by_reason[skip_reason] += 1
             continue
         fp = sym["path"]
         if fp not in file_lines_cache:
@@ -135,6 +140,11 @@ async def _embed_pending():
                 file_lines_cache[fp] = []
         text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
         pending.append((sym["symbol_id"], text))
+        pending_by_type[sym.get("type", "unknown")] += 1
+
+    logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
+    if skipped_by_reason:
+        logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
 
     for i in range(0, len(pending), EMBED_BATCH_SIZE):
         batch = pending[i : i + EMBED_BATCH_SIZE]
@@ -164,6 +174,24 @@ def _skip_embedding(sym: dict) -> bool:
         if end - start <= 2:
             return True
     return False
+
+
+def _skip_embedding_reason(sym: dict) -> Optional[str]:
+    sym_type = sym.get("type", "")
+    if sym_type == "import":
+        return "import"
+    if sym_type in ("method", "function"):
+        start = sym.get("line") or 0
+        end = sym.get("end_line") or 0
+        if end - start <= 2:
+            return "trivial_method"
+    return None
+
+
+def _format_counter(counter: collections.Counter) -> str:
+    if not counter:
+        return "none"
+    return ", ".join(f"{key}: {count}" for key, count in sorted(counter.items()))
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────
@@ -314,14 +342,24 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
         else:
             symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
 
+        symbol_rows = deep.store_ref._conn().execute(
+            "SELECT type, COUNT(*) AS cnt FROM symbols GROUP BY type"
+        ).fetchall()
+        symbol_counts = collections.Counter(
+            {row["type"] or "unknown": row["cnt"] for row in symbol_rows}
+        )
+        logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
+
         # Build (symbol_id, embed_text) pairs, skipping low-value symbols.
         # Cache file lines per path to avoid re-reading the same file for each symbol.
         pending: list[tuple[str, str]] = []
-        skipped = 0
         file_lines_cache: dict[str, list[str]] = {}
+        pending_by_type: collections.Counter[str] = collections.Counter()
+        skipped_by_reason: collections.Counter[str] = collections.Counter()
         for sym in symbols_needing_embed:
-            if _skip_embedding(sym):
-                skipped += 1
+            skip_reason = _skip_embedding_reason(sym)
+            if skip_reason:
+                skipped_by_reason[skip_reason] += 1
                 continue
             fp = sym["path"]
             if fp not in file_lines_cache:
@@ -332,8 +370,11 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
                     file_lines_cache[fp] = []
             text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
             pending.append((sym["symbol_id"], text))
-        if skipped:
-            logger.info("Skipped %d low-value symbols (imports, trivial 1-2 liners)", skipped)
+            pending_by_type[sym.get("type", "unknown")] += 1
+
+        logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
+        if skipped_by_reason:
+            logger.info("Skipped embedding by reason: %s", _format_counter(skipped_by_reason))
 
         for i in range(0, len(pending), EMBED_BATCH_SIZE):
             batch = pending[i : i + EMBED_BATCH_SIZE]

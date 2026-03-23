@@ -16,3 +16,4 @@ wheels/
 src/code_indexer/indexing/strategies/*.so
 src/code_indexer/indexing/strategies/*.dylib
 src/code_indexer/indexing/strategies/*.dll
+.DS_Store

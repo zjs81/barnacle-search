@@ -32,9 +32,7 @@ class CSharpStrategy(ParsingStrategy):
 
     def parse_file(self, file_path: str, content: str) -> FileInfo:
         try:
-            with open(file_path, "rb") as fh:
-                raw = fh.read(8000)
-            if b"\x00" in raw:
+            if "\x00" in content:
                 return FileInfo(
                     path=file_path,
                     language="csharp",
@@ -42,9 +40,6 @@ class CSharpStrategy(ParsingStrategy):
                     mtime=os.path.getmtime(file_path),
                     error="Binary file skipped",
                 )
-
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
-                content = fh.read()
 
             mtime = os.path.getmtime(file_path)
             line_count = content.count("\n") + 1
@@ -56,7 +51,14 @@ class CSharpStrategy(ParsingStrategy):
             imports: list[str] = []
             symbols: list[SymbolInfo] = []
 
-            self._traverse(tree.root_node, content_bytes, file_path, imports, symbols, namespace_stack=[], container_stack=[])
+            self._traverse(
+                tree.root_node,
+                content_bytes,
+                file_path,
+                imports,
+                symbols,
+                class_stack=[],
+            )
 
             return FileInfo(
                 path=file_path,
@@ -146,10 +148,9 @@ class CSharpStrategy(ParsingStrategy):
         file_path: str,
         imports: list[str],
         symbols: list[SymbolInfo],
-        namespace_stack: list[str],
-        container_stack: list[str],
+        class_stack: list[str],
     ) -> None:
-        """Recursively walk the AST and collect imports and symbols."""
+        """Recursively walk the AST and collect imports and top-level symbols."""
 
         ntype = node.type
 
@@ -160,25 +161,14 @@ class CSharpStrategy(ParsingStrategy):
             return  # no interesting children inside using_directive
 
         if ntype in ("namespace_declaration", "file_scoped_namespace_declaration"):
-            ns_name = None
             for child in node.children:
-                if child.type in ("identifier", "qualified_name"):
-                    ns_name = self.read_node_text(child, content_bytes)
-                    break
-            if ns_name:
-                namespace_stack.append(ns_name)
-                for child in node.children:
-                    self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
-                namespace_stack.pop()
-            else:
-                for child in node.children:
-                    self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
+                self._traverse(child, content_bytes, file_path, imports, symbols, class_stack)
             return
 
         if ntype in ("class_declaration", "struct_declaration", "record_declaration"):
             name = self._get_identifier_child(node, content_bytes)
             if name:
-                qualified = ".".join(container_stack + [name]) if container_stack else name
+                qualified = ".".join(class_stack + [name]) if class_stack else name
                 symbols.append(SymbolInfo(
                     type="class",
                     name=name,
@@ -186,21 +176,21 @@ class CSharpStrategy(ParsingStrategy):
                     file=file_path,
                     line=self.node_line(node),
                     end_line=self.node_end_line(node),
-                    parent=container_stack[-1] if container_stack else (namespace_stack[-1] if namespace_stack else None),
+                    parent=class_stack[-1] if class_stack else None,
                 ))
-                container_stack.append(name)
+                class_stack.append(name)
                 for child in node.children:
-                    self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
-                container_stack.pop()
+                    self._traverse(child, content_bytes, file_path, imports, symbols, class_stack)
+                class_stack.pop()
             else:
                 for child in node.children:
-                    self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
+                    self._traverse(child, content_bytes, file_path, imports, symbols, class_stack)
             return
 
         if ntype == "interface_declaration":
             name = self._get_identifier_child(node, content_bytes)
             if name:
-                qualified = ".".join(container_stack + [name]) if container_stack else name
+                qualified = ".".join(class_stack + [name]) if class_stack else name
                 symbols.append(SymbolInfo(
                     type="interface",
                     name=name,
@@ -208,21 +198,21 @@ class CSharpStrategy(ParsingStrategy):
                     file=file_path,
                     line=self.node_line(node),
                     end_line=self.node_end_line(node),
-                    parent=container_stack[-1] if container_stack else (namespace_stack[-1] if namespace_stack else None),
+                    parent=class_stack[-1] if class_stack else None,
                 ))
-                container_stack.append(name)
+                class_stack.append(name)
                 for child in node.children:
-                    self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
-                container_stack.pop()
+                    self._traverse(child, content_bytes, file_path, imports, symbols, class_stack)
+                class_stack.pop()
             else:
                 for child in node.children:
-                    self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
+                    self._traverse(child, content_bytes, file_path, imports, symbols, class_stack)
             return
 
         if ntype == "enum_declaration":
             name = self._get_identifier_child(node, content_bytes)
             if name:
-                qualified = ".".join(container_stack + [name]) if container_stack else name
+                qualified = ".".join(class_stack + [name]) if class_stack else name
                 symbols.append(SymbolInfo(
                     type="enum",
                     name=name,
@@ -230,7 +220,7 @@ class CSharpStrategy(ParsingStrategy):
                     file=file_path,
                     line=self.node_line(node),
                     end_line=self.node_end_line(node),
-                    parent=container_stack[-1] if container_stack else (namespace_stack[-1] if namespace_stack else None),
+                    parent=class_stack[-1] if class_stack else None,
                 ))
             # enums have no member declarations we recurse into
             return
@@ -238,16 +228,14 @@ class CSharpStrategy(ParsingStrategy):
         if ntype == "method_declaration":
             method_name = self._get_method_name(node, content_bytes)
             if method_name:
-                container = container_stack[-1] if container_stack else None
+                container = class_stack[-1] if class_stack else None
                 short_name = f"{container}.{method_name}" if container else method_name
-                # Build overload-disambiguating signature
                 sig = self._extract_method_signature(node, content_bytes, short_name)
-                qualified = ".".join(container_stack[:-1] + [sig]) if container_stack else sig
-                # For symbol_id use the disambiguating sig
+                symbol_id_name = sig or short_name
                 symbols.append(SymbolInfo(
                     type="method",
                     name=short_name,
-                    symbol_id=self.make_symbol_id(file_path, qualified),
+                    symbol_id=self.make_symbol_id(file_path, symbol_id_name),
                     file=file_path,
                     line=self.node_line(node),
                     end_line=self.node_end_line(node),
@@ -256,45 +244,6 @@ class CSharpStrategy(ParsingStrategy):
                 ))
             return  # don't recurse into method bodies
 
-        if ntype == "property_declaration":
-            name = self._get_identifier_child(node, content_bytes)
-            if name:
-                container = container_stack[-1] if container_stack else None
-                short_name = f"{container}.{name}" if container else name
-                qualified = ".".join(container_stack[:-1] + [short_name]) if container_stack else short_name
-                symbols.append(SymbolInfo(
-                    type="property",
-                    name=short_name,
-                    symbol_id=self.make_symbol_id(file_path, qualified),
-                    file=file_path,
-                    line=self.node_line(node),
-                    end_line=self.node_end_line(node),
-                    parent=container,
-                ))
-            return
-
-        if ntype == "field_declaration":
-            container = container_stack[-1] if container_stack else None
-            # Find the variable_declaration, then all variable_declarator nodes
-            for child in node.children:
-                if child.type == "variable_declaration":
-                    for vdecl in child.children:
-                        if vdecl.type == "variable_declarator":
-                            field_name = self._get_identifier_child(vdecl, content_bytes)
-                            if field_name:
-                                short_name = f"{container}.{field_name}" if container else field_name
-                                qualified = ".".join(container_stack[:-1] + [short_name]) if container_stack else short_name
-                                symbols.append(SymbolInfo(
-                                    type="field",
-                                    name=short_name,
-                                    symbol_id=self.make_symbol_id(file_path, qualified),
-                                    file=file_path,
-                                    line=self.node_line(vdecl),
-                                    end_line=self.node_end_line(vdecl),
-                                    parent=container,
-                                ))
-            return
-
         # Default: recurse into children
         for child in node.children:
-            self._traverse(child, content_bytes, file_path, imports, symbols, namespace_stack, container_stack)
+            self._traverse(child, content_bytes, file_path, imports, symbols, class_stack)

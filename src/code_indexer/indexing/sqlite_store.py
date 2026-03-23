@@ -69,17 +69,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
     short_name,
     parent,
     signature,
+    body_text,
     tokenize='unicode61'
 );
 """
 
 _MIGRATE_SQL = """
+DROP TABLE IF EXISTS symbol_fts;
 CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
     symbol_id UNINDEXED,
     file_path,
     short_name,
     parent,
     signature,
+    body_text,
     tokenize='unicode61'
 );
 """
@@ -95,8 +98,9 @@ class SQLiteStore:
         # Initialize schema on the main thread
         conn = self._conn()
         conn.executescript(_CREATE_SQL)
-        # Migrate existing DBs that predate symbol_fts
+        # Rebuild FTS so schema stays in sync with indexed columns.
         conn.executescript(_MIGRATE_SQL)
+        self._rebuild_symbol_fts(conn)
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -160,6 +164,13 @@ class SQLiteStore:
         conn.execute("DELETE FROM files WHERE path=?", (path,))
         conn.commit()
 
+    def clear_files(self):
+        """Remove all indexed files, symbols, embeddings, and FTS rows in one transaction."""
+        conn = self._conn()
+        conn.execute("DELETE FROM symbol_fts")
+        conn.execute("DELETE FROM files")
+        conn.commit()
+
     def get_file(self, path: str) -> Optional[dict]:
         row = self._conn().execute(
             "SELECT * FROM files WHERE path=?", (path,)
@@ -211,15 +222,102 @@ class SQLiteStore:
         # Populate FTS index (INSERT OR IGNORE — won't re-add duplicates)
         conn.executemany(
             """
-            INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature, body_text)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
-                (s.symbol_id, file_path, s.name or "", s.parent or "", s.signature or "")
+                (
+                    s.symbol_id,
+                    file_path,
+                    s.name or "",
+                    s.parent or "",
+                    s.signature or "",
+                    s.body_text or "",
+                )
                 for s in symbols
             ],
         )
         conn.commit()
+
+    def persist_file_and_symbols(
+        self,
+        file_info: FileInfo,
+        symbols: list[SymbolInfo],
+        *,
+        replace_existing: bool = False,
+    ) -> int:
+        """
+        Persist a file row and its symbols in a single transaction.
+
+        If replace_existing is True, any previous file row is removed first so
+        stale symbols and embeddings are cleared via CASCADE.
+        """
+        conn = self._conn()
+
+        if replace_existing:
+            conn.execute("DELETE FROM symbol_fts WHERE file_path=?", (file_info.path,))
+            conn.execute("DELETE FROM files WHERE path=?", (file_info.path,))
+
+        conn.execute(
+            """
+            INSERT INTO files(path, language, line_count, mtime, imports, exports)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                language   = excluded.language,
+                line_count = excluded.line_count,
+                mtime      = excluded.mtime,
+                imports    = excluded.imports,
+                exports    = excluded.exports
+            """,
+            (
+                file_info.path,
+                file_info.language,
+                file_info.line_count,
+                file_info.mtime,
+                json.dumps(file_info.imports),
+                json.dumps(file_info.exports),
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM files WHERE path=?", (file_info.path,)
+        ).fetchone()
+        file_id = row["id"]
+
+        if symbols:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO symbols
+                    (symbol_id, file_id, type, short_name, parent, line, end_line, signature)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        s.symbol_id, file_id, s.type, s.name,
+                        s.parent, s.line, s.end_line, s.signature,
+                    )
+                    for s in symbols
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature, body_text)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        s.symbol_id,
+                        file_info.path,
+                        s.name or "",
+                        s.parent or "",
+                        s.signature or "",
+                        s.body_text or "",
+                    )
+                    for s in symbols
+                ],
+            )
+
+        conn.commit()
+        return file_id
 
     def get_symbols_for_file(self, path: str) -> list[dict]:
         row = self._conn().execute(
@@ -252,12 +350,15 @@ class SQLiteStore:
         so we negate them to get positive scores.
         """
         # Sanitize query: FTS5 treats some chars as operators
-        safe_query = " ".join(
+        terms = [
             word for word in query.split()
             if word and not word.startswith(("-", "+", "^", '"', "*"))
-        )
-        if not safe_query:
+        ]
+        if not terms:
             return []
+        # Natural-language queries should reward partial term overlap instead of
+        # requiring every token in the same FTS row.
+        safe_query = " OR ".join(terms)
         try:
             rows = self._conn().execute(
                 """
@@ -272,6 +373,35 @@ class SQLiteStore:
             return [(r["symbol_id"], float(r["score"])) for r in rows]
         except Exception:
             return []
+
+    def _rebuild_symbol_fts(self, conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM symbol_fts")
+        rows = conn.execute(
+            """
+            SELECT s.symbol_id, f.path, s.short_name, s.parent, s.signature
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            """
+        ).fetchall()
+        if not rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO symbol_fts(symbol_id, file_path, short_name, parent, signature, body_text)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["symbol_id"],
+                    row["path"] or "",
+                    row["short_name"] or "",
+                    row["parent"] or "",
+                    row["signature"] or "",
+                    "",
+                )
+                for row in rows
+            ],
+        )
 
     # ── Symbol Embeddings ────────────────────────────────────────────────────
 

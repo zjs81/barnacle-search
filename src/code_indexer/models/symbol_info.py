@@ -16,3 +16,4 @@ class SymbolInfo:
     signature: Optional[str] = None   # full signature / attribute value
     docstring: Optional[str] = None
     parent: Optional[str] = None      # containing class/namespace name
+    body_text: Optional[str] = None   # truncated source body used for FTS/embedding

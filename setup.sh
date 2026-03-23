@@ -3,6 +3,7 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EMBED_MODEL="granite-embedding"
 
 # ── 1. Check dependencies ─────────────────────────────────────────────────────
 
@@ -77,7 +78,16 @@ print("Registered barnacle-search in", claude_json)
 PYEOF
 fi
 
-# ── 6. Done ───────────────────────────────────────────────────────────────────
+# ── 6. Pull Ollama embedding model if available ───────────────────────────────
+
+if command -v ollama &>/dev/null; then
+    echo "Pulling Ollama embedding model ($EMBED_MODEL)..."
+    ollama pull "$EMBED_MODEL"
+else
+    echo "Ollama not found; skipping model pull."
+fi
+
+# ── 7. Done ───────────────────────────────────────────────────────────────────
 
 echo ""
 echo "barnacle-search is ready!"
@@ -89,4 +99,4 @@ echo "       set_project_path(\"/path/to/your/project\")"
 echo "       build_deep_index()"
 echo ""
 echo "Requires Ollama for semantic search:"
-echo "  brew install ollama && ollama pull qwen3-embedding:0.6b"
+echo "  brew install ollama && ollama pull $EMBED_MODEL"

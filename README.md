@@ -59,11 +59,11 @@ Semantic search requires a running Ollama instance with the embedding model pull
 ```bash
 # macOS
 brew install ollama
-ollama pull qwen3-embedding:0.6b
+ollama pull granite-embedding
 
 # Windows
 winget install Ollama.Ollama
-ollama pull qwen3-embedding:0.6b
+ollama pull granite-embedding
 ```
 
 Barnacle will auto-pull the model if Ollama is running but the model isn't downloaded yet. Structural search (symbols, regex) works fine without Ollama.
@@ -131,14 +131,14 @@ Embeddings are generated per symbol (class, method, function), not per file. Eac
 ```
 path/to/File.cs [csharp] > ClassName > MethodName
 signature: ClassName.MethodName(int userId, string name)
-<up to 40 lines of body>
+<up to 510 tokens of body>
 ```
 
 This means `semantic_search("password hashing")` returns `PasswordHasher.Hash()` directly instead of a file that happens to contain it somewhere. `semantic_search` results include a `matched_symbols` list showing which specific symbols scored highest and their individual scores.
 
 Not every symbol gets embedded — imports and trivial methods/functions (≤2 lines) are filtered out as noise. This typically cuts embedding count by 20-40% on real codebases while keeping all the symbols worth searching for.
 
-Embed text is capped at 2000 characters to prevent context overflow errors on unusually large methods. Symbols are sent to Ollama in batches of 64 for throughput. A large codebase (~28k symbols after filtering) typically indexes in 5-6 minutes.
+Embed text is capped at 510 body tokens to prevent giant methods from bloating request size. Symbols are sent to Ollama in batches of 64 for throughput. A large codebase (~28k symbols after filtering) typically indexes in 5-6 minutes.
 
 ### Hybrid search
 

@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $RepoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$EmbedModel = "granite-embedding"
 
 # ── 1. Check dependencies ─────────────────────────────────────────────────────
 
@@ -77,7 +78,16 @@ $config.mcpServers | Add-Member -MemberType NoteProperty -Name "barnacle-search"
 $config | ConvertTo-Json -Depth 10 | Set-Content $ClaudeJson -Encoding UTF8
 Write-Host "Registered barnacle-search in $ClaudeJson"
 
-# ── 6. Done ───────────────────────────────────────────────────────────────────
+# ── 6. Pull Ollama embedding model if available ───────────────────────────────
+
+if (Get-Command ollama -ErrorAction SilentlyContinue) {
+    Write-Host "Pulling Ollama embedding model ($EmbedModel)..."
+    ollama pull $EmbedModel
+} else {
+    Write-Host "Ollama not found; skipping model pull."
+}
+
+# ── 7. Done ───────────────────────────────────────────────────────────────────
 
 Write-Host ""
 Write-Host "barnacle-search is ready!"
@@ -90,4 +100,4 @@ Write-Host "       build_deep_index()"
 Write-Host ""
 Write-Host "Requires Ollama for semantic search:"
 Write-Host "  winget install Ollama.Ollama"
-Write-Host "  ollama pull qwen3-embedding:0.6b"
+Write-Host "  ollama pull $EmbedModel"

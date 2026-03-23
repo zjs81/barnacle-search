@@ -55,9 +55,7 @@ class DartStrategy(ParsingStrategy):
 
     def parse_file(self, file_path: str, content: str) -> FileInfo:
         try:
-            with open(file_path, "rb") as fh:
-                raw = fh.read(8000)
-            if b"\x00" in raw:
+            if "\x00" in content:
                 return FileInfo(
                     path=file_path,
                     language="dart",
@@ -65,9 +63,6 @@ class DartStrategy(ParsingStrategy):
                     mtime=os.path.getmtime(file_path),
                     error="Binary file skipped",
                 )
-
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
-                content = fh.read()
 
             mtime = os.path.getmtime(file_path)
             line_count = content.count("\n") + 1

@@ -27,7 +27,7 @@ SHALLOW_INDEX_FILE = "shallow.json"
 DEEP_INDEX_DB_FILE = "index.db"
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-EMBED_MODEL = "qwen3-embedding:0.6b"
+EMBED_MODEL = "granite-embedding"
 
 EMBED_BATCH_SIZE = 64
 

@@ -205,6 +205,22 @@ class TestFTSSearch:
         results = store.fts_search("PasswordHasher")
         assert len(results) > 0
 
+    def test_fts_finds_by_body_text(self, store, sample_file):
+        sym = make_symbol("RouteMeshMessage")
+        sym.body_text = "mesh network node connection handling retries"
+        store.insert_symbols(sample_file, [sym])
+        results = store.fts_search("connection handling")
+        sym_ids = [r[0] for r in results]
+        assert "foo.py::Foo.RouteMeshMessage" in sym_ids
+
+    def test_fts_multiword_query_uses_or_matching(self, store, sample_file):
+        sym = make_symbol("ConnectMeshNode")
+        sym.body_text = "mesh node transport retry logic"
+        store.insert_symbols(sample_file, [sym])
+        results = store.fts_search("mesh network connection handling")
+        sym_ids = [r[0] for r in results]
+        assert "foo.py::Foo.ConnectMeshNode" in sym_ids
+
     def test_fts_returns_empty_for_no_match(self, store, sample_file):
         store.insert_symbols(sample_file, [make_symbol("parse")])
         results = store.fts_search("xyzzy_nonexistent_token_12345")
