@@ -8,7 +8,6 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from ..constants import EXCLUDE_DIRS, INDEX_MAX_WORKERS, SUPPORTED_EXTENSIONS
@@ -44,44 +43,9 @@ class IndexBuilder:
         Parse all files in project_path in parallel.
         Returns {"files": N, "symbols": M, "errors": K}
         """
-        files = self._collect_files()
-        total_files = 0
-        total_symbols = 0
-        total_errors = 0
-
-        with ThreadPoolExecutor(max_workers=INDEX_MAX_WORKERS) as executor:
-            futures = {executor.submit(self._process_file, fp): fp for fp in files}
-            for future in as_completed(futures):
-                fp = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    log.warning("Unexpected error processing %s: %s", fp, exc)
-                    total_errors += 1
-                    continue
-
-                if result is None:
-                    total_errors += 1
-                    continue
-
-                file_info, symbols = result
-                if file_info.error:
-                    total_errors += 1
-
-                try:
-                    self.store.persist_file_and_symbols(file_info, symbols)
-                except Exception as exc:
-                    log.warning("DB write failed for %s: %s", fp, exc)
-                    total_errors += 1
-                    continue
-
-                total_files += 1
-                total_symbols += len(symbols)
-
-        self.store.set_meta("built_at", str(time.time()))
-        self.store.set_meta("project_path", self.project_path)
-
-        return {"files": total_files, "symbols": total_symbols, "errors": total_errors}
+        stats = self.build_files(self._collect_files())
+        self._finalize_build_metadata()
+        return stats
 
     def rebuild_file(self, file_path: str) -> bool:
         """
@@ -103,7 +67,7 @@ class IndexBuilder:
         # Step 3: persist
         try:
             self.store.persist_file_and_symbols(
-                file_info, symbols, replace_existing=True
+                file_info, symbols, replace_existing=False
             )
         except Exception as exc:
             log.warning("DB write failed for %s: %s", file_path, exc)
@@ -132,7 +96,7 @@ class IndexBuilder:
 
         try:
             file_info = strategy.parse_file(file_path, content)
-            self._populate_symbol_bodies(file_info.symbols, content.splitlines())
+            self._populate_symbol_bodies(file_info.symbols, content)
         except Exception as exc:
             log.warning("Parse error for %s: %s", file_path, exc)
             # Build a minimal FileInfo so the file is still recorded
@@ -141,7 +105,7 @@ class IndexBuilder:
                 mtime = os.path.getmtime(file_path)
             except OSError:
                 pass
-            ext = Path(file_path).suffix.lower()
+            ext = os.path.splitext(file_path)[1].lower()
             lang_map = {
                 ".cs": "csharp",
                 ".js": "javascript", ".jsx": "javascript",
@@ -160,15 +124,86 @@ class IndexBuilder:
 
         return file_info, file_info.symbols
 
+    def build_files(self, files: list[str], *, replace_existing: bool = False) -> dict:
+        total_files = 0
+        total_symbols = 0
+        total_errors = 0
+
+        with ThreadPoolExecutor(max_workers=INDEX_MAX_WORKERS) as executor:
+            futures = {executor.submit(self._process_file, fp): fp for fp in files}
+            for future in as_completed(futures):
+                fp = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    log.warning("Unexpected error processing %s: %s", fp, exc)
+                    total_errors += 1
+                    continue
+
+                if result is None:
+                    total_errors += 1
+                    continue
+
+                file_info, symbols = result
+                if file_info.error:
+                    total_errors += 1
+
+                try:
+                    self.store.persist_file_and_symbols(
+                        file_info,
+                        symbols,
+                        replace_existing=replace_existing,
+                        commit=False,
+                    )
+                except Exception as exc:
+                    log.warning("DB write failed for %s: %s", fp, exc)
+                    total_errors += 1
+                    continue
+
+                total_files += 1
+                total_symbols += len(symbols)
+
+        return {"files": total_files, "symbols": total_symbols, "errors": total_errors}
+
+    def _finalize_build_metadata(self) -> None:
+        self.store.set_meta_many(
+            {
+                "built_at": str(time.time()),
+                "project_path": self.project_path,
+            },
+            commit=False,
+        )
+        self.store.commit()
+
     def _collect_files(self) -> list[str]:
         """Walk project_path, returning absolute paths to supported files."""
-        result: list[str] = []
-        for dirpath, dirnames, filenames in os.walk(self.project_path, topdown=True):
-            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-            for filename in filenames:
-                ext = Path(filename).suffix.lower()
-                if ext in SUPPORTED_EXTENSIONS:
-                    result.append(os.path.join(dirpath, filename))
+        return [path for path, _mtime in self._collect_file_entries()]
+
+    def _collect_file_entries(self) -> list[tuple[str, float]]:
+        """Walk project_path, returning (absolute_path, mtime) for supported files."""
+        result: list[tuple[str, float]] = []
+        stack = [self.project_path]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        name = entry.name
+                        if entry.is_dir(follow_symlinks=False):
+                            if name.startswith(".") or name in EXCLUDE_DIRS:
+                                continue
+                            stack.append(entry.path)
+                            continue
+                        ext = os.path.splitext(name)[1].lower()
+                        if ext not in SUPPORTED_EXTENSIONS:
+                            continue
+                        try:
+                            stat = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        result.append((entry.path, stat.st_mtime))
+            except OSError:
+                continue
         return result
 
     def build_embed_text(self, file_path: str, file_info: FileInfo) -> str:
@@ -259,14 +294,21 @@ class IndexBuilder:
         if not text or max_tokens <= 0:
             return ""
 
-        tokens = list(_TOKEN_RE.finditer(text))
-        if len(tokens) <= max_tokens:
-            return text
+        token_count = 0
+        for match in _TOKEN_RE.finditer(text):
+            token_count += 1
+            if token_count > max_tokens:
+                return text[:match.start()].rstrip()
+        return text
 
-        cutoff = tokens[max_tokens].start()
-        return text[:cutoff].rstrip()
+    def _populate_symbol_bodies(self, symbols: list[SymbolInfo], content: str) -> None:
+        line_offsets = [0]
+        for index, char in enumerate(content):
+            if char == "\n":
+                line_offsets.append(index + 1)
+        line_offsets.append(len(content))
 
-    def _populate_symbol_bodies(self, symbols: list[SymbolInfo], file_lines: list[str]) -> None:
+        total_lines = len(line_offsets) - 1
         for symbol in symbols:
             start_line = symbol.line
             end_line = symbol.end_line or start_line
@@ -274,9 +316,9 @@ class IndexBuilder:
                 symbol.body_text = None
                 continue
             start_idx = start_line - 1
-            end_idx = min(len(file_lines), end_line)
-            if start_idx >= len(file_lines) or start_idx < 0 or end_idx <= start_idx:
+            end_idx = min(total_lines, end_line)
+            if start_idx >= total_lines or start_idx < 0 or end_idx <= start_idx:
                 symbol.body_text = None
                 continue
-            body = "\n".join(file_lines[start_idx:end_idx]).strip()
+            body = content[line_offsets[start_idx]:line_offsets[end_idx]].strip()
             symbol.body_text = self._truncate_body_tokens(body, _EMBED_BODY_MAX_TOKENS)

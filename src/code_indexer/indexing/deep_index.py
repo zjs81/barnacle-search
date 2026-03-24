@@ -42,80 +42,32 @@ class DeepIndex:
             return self.builder.build_all()
 
         # Incremental: collect candidate files, skip unchanged ones
-        all_files = self.builder._collect_files()
+        all_entries = self.builder._collect_file_entries()
+        stored_mtimes = self.store.get_file_mtime_map()
         changed: list[str] = []
-        for fp in all_files:
-            row = self.store.get_file(fp)
-            if row is None:
+        existing_on_disk: set[str] = set()
+        for fp, current_mtime in all_entries:
+            existing_on_disk.add(fp)
+            stored_mtime = stored_mtimes.get(fp)
+            if stored_mtime is None:
                 changed.append(fp)
                 continue
-            try:
-                current_mtime = os.path.getmtime(fp)
-            except OSError:
-                changed.append(fp)
-                continue
-            if current_mtime != row["mtime"]:
+            if current_mtime != stored_mtime:
                 changed.append(fp)
 
         # Also remove DB entries for files that no longer exist on disk
-        existing_on_disk = set(all_files)
-        for db_path in self.store.get_all_file_paths():
+        removed = False
+        for db_path in stored_mtimes:
             if db_path not in existing_on_disk:
-                self.store.delete_file(db_path)
+                self.store.delete_file(db_path, commit=False)
+                removed = True
 
         if not changed:
-            import time
-            self.store.set_meta("built_at", str(time.time()))
-            self.store.set_meta("project_path", self.project_path)
+            self.builder._finalize_build_metadata()
             return {"files": 0, "symbols": 0, "errors": 0}
-
-        # Temporarily narrow builder to the changed subset
-        total_files = 0
-        total_symbols = 0
-        total_errors = 0
-
-        import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from ..constants import INDEX_MAX_WORKERS
-
-        with ThreadPoolExecutor(max_workers=INDEX_MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(self.builder._process_file, fp): fp
-                for fp in changed
-            }
-            for future in as_completed(futures):
-                fp = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    log.warning("Error processing %s: %s", fp, exc)
-                    total_errors += 1
-                    continue
-
-                if result is None:
-                    total_errors += 1
-                    continue
-
-                file_info, symbols = result
-                if file_info.error:
-                    total_errors += 1
-
-                try:
-                    self.store.persist_file_and_symbols(
-                        file_info, symbols, replace_existing=True
-                    )
-                except Exception as exc:
-                    log.warning("DB write failed for %s: %s", fp, exc)
-                    total_errors += 1
-                    continue
-
-                total_files += 1
-                total_symbols += len(symbols)
-
-        self.store.set_meta("built_at", str(time.time()))
-        self.store.set_meta("project_path", self.project_path)
-
-        return {"files": total_files, "symbols": total_symbols, "errors": total_errors}
+        stats = self.builder.build_files(changed, replace_existing=True)
+        self.builder._finalize_build_metadata()
+        return stats
 
     # ── Query ─────────────────────────────────────────────────────────────────
 
@@ -174,9 +126,7 @@ class DeepIndex:
         file_path = os.path.abspath(file_path)
         raw_symbols = self.store.get_symbols_for_file(file_path)
 
-        target = next(
-            (s for s in raw_symbols if s["short_name"] == symbol_name), None
-        )
+        target = self._match_symbol_for_body(raw_symbols, symbol_name)
         if target is None:
             return None
 
@@ -199,6 +149,45 @@ class DeepIndex:
         # end_line is inclusive, slice end is exclusive
         selected = all_lines[start_idx:end_idx]
         return "".join(selected)
+
+    def _match_symbol_for_body(self, raw_symbols: list[dict], symbol_name: str) -> Optional[dict]:
+        def last_segment(value: Optional[str]) -> str:
+            if not value:
+                return ""
+            return value.rsplit(".", 1)[-1]
+
+        def signature_name(value: Optional[str]) -> str:
+            if not value:
+                return ""
+            return value.split("(", 1)[0]
+
+        exact_short = next((s for s in raw_symbols if s["short_name"] == symbol_name), None)
+        if exact_short is not None:
+            return exact_short
+
+        exact_signature = next((s for s in raw_symbols if s.get("signature") == symbol_name), None)
+        if exact_signature is not None:
+            return exact_signature
+
+        short_tail = next(
+            (s for s in raw_symbols if last_segment(s["short_name"]) == symbol_name),
+            None,
+        )
+        if short_tail is not None:
+            return short_tail
+
+        signature_exact = next(
+            (s for s in raw_symbols if signature_name(s.get("signature")) == symbol_name),
+            None,
+        )
+        if signature_exact is not None:
+            return signature_exact
+
+        signature_tail = next(
+            (s for s in raw_symbols if last_segment(signature_name(s.get("signature"))) == symbol_name),
+            None,
+        )
+        return signature_tail
 
     def find_symbol(self, name: str) -> list[dict]:
         """Search symbols across all files by short name."""

@@ -108,17 +108,104 @@ class SQLiteStore:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return self._local.conn
 
+    def commit(self):
+        self._conn().commit()
+
+    def _commit_if_needed(self, conn: sqlite3.Connection, commit: bool) -> None:
+        if commit:
+            conn.commit()
+
+    def _file_row_values(self, file_info: FileInfo) -> tuple:
+        return (
+            file_info.path,
+            file_info.language,
+            file_info.line_count,
+            file_info.mtime,
+            json.dumps(file_info.imports),
+            json.dumps(file_info.exports),
+        )
+
+    def _symbol_insert_rows(self, symbols: list[SymbolInfo], file_id: int) -> list[tuple]:
+        return [
+            (
+                s.symbol_id,
+                file_id,
+                s.type,
+                s.name,
+                s.parent,
+                s.line,
+                s.end_line,
+                s.signature,
+            )
+            for s in symbols
+        ]
+
+    def _symbol_fts_rows(self, symbols: list[SymbolInfo], file_path: str) -> list[tuple]:
+        return [
+            (
+                s.symbol_id,
+                file_path,
+                s.name or "",
+                s.parent or "",
+                s.signature or "",
+                s.body_text or "",
+            )
+            for s in symbols
+        ]
+
+    def _insert_symbol_rows(
+        self,
+        conn: sqlite3.Connection,
+        file_id: int,
+        file_path: str,
+        symbols: list[SymbolInfo],
+    ) -> None:
+        if not symbols:
+            return
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO symbols
+                (symbol_id, file_id, type, short_name, parent, line, end_line, signature)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._symbol_insert_rows(symbols, file_id),
+        )
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature, body_text)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            self._symbol_fts_rows(symbols, file_path),
+        )
+
+    def _replace_file_rows(self, conn: sqlite3.Connection, path: str) -> None:
+        conn.execute("DELETE FROM symbol_fts WHERE file_path=?", (path,))
+        conn.execute("DELETE FROM files WHERE path=?", (path,))
+
     # ── Metadata ────────────────────────────────────────────────────────────
 
-    def set_meta(self, key: str, value: str):
-        self._conn().execute(
+    def set_meta(self, key: str, value: str, *, commit: bool = True):
+        conn = self._conn()
+        conn.execute(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)", (key, value)
         )
-        self._conn().commit()
+        self._commit_if_needed(conn, commit)
+
+    def set_meta_many(self, items: dict[str, str], *, commit: bool = True):
+        if not items:
+            return
+        conn = self._conn()
+        conn.executemany(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+            list(items.items()),
+        )
+        self._commit_if_needed(conn, commit)
 
     def get_meta(self, key: str) -> Optional[str]:
         row = self._conn().execute(
@@ -128,9 +215,9 @@ class SQLiteStore:
 
     # ── Files ────────────────────────────────────────────────────────────────
 
-    def upsert_file(self, file_info: FileInfo) -> int:
+    def upsert_file(self, file_info: FileInfo, *, commit: bool = True) -> int:
         conn = self._conn()
-        cur = conn.execute(
+        conn.execute(
             """
             INSERT INTO files(path, language, line_count, mtime, imports, exports)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -141,35 +228,27 @@ class SQLiteStore:
                 imports    = excluded.imports,
                 exports    = excluded.exports
             """,
-            (
-                file_info.path,
-                file_info.language,
-                file_info.line_count,
-                file_info.mtime,
-                json.dumps(file_info.imports),
-                json.dumps(file_info.exports),
-            ),
+            self._file_row_values(file_info),
         )
-        conn.commit()
+        self._commit_if_needed(conn, commit)
         # Fetch the id (works whether INSERT or UPDATE)
         row = conn.execute(
             "SELECT id FROM files WHERE path=?", (file_info.path,)
         ).fetchone()
         return row["id"]
 
-    def delete_file(self, path: str):
+    def delete_file(self, path: str, *, commit: bool = True):
         conn = self._conn()
         # Remove FTS entries for this file before CASCADE deletes the symbols
-        conn.execute("DELETE FROM symbol_fts WHERE file_path=?", (path,))
-        conn.execute("DELETE FROM files WHERE path=?", (path,))
-        conn.commit()
+        self._replace_file_rows(conn, path)
+        self._commit_if_needed(conn, commit)
 
-    def clear_files(self):
+    def clear_files(self, *, commit: bool = True):
         """Remove all indexed files, symbols, embeddings, and FTS rows in one transaction."""
         conn = self._conn()
         conn.execute("DELETE FROM symbol_fts")
         conn.execute("DELETE FROM files")
-        conn.commit()
+        self._commit_if_needed(conn, commit)
 
     def get_file(self, path: str) -> Optional[dict]:
         row = self._conn().execute(
@@ -186,6 +265,10 @@ class SQLiteStore:
         rows = self._conn().execute("SELECT path, mtime FROM files").fetchall()
         return [dict(r) for r in rows]
 
+    def get_file_mtime_map(self) -> dict[str, float]:
+        rows = self._conn().execute("SELECT path, mtime FROM files").fetchall()
+        return {r["path"]: r["mtime"] for r in rows}
+
     def get_file_count(self) -> int:
         return self._conn().execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
@@ -197,47 +280,15 @@ class SQLiteStore:
 
     # ── Symbols ──────────────────────────────────────────────────────────────
 
-    def insert_symbols(self, file_id: int, symbols: list[SymbolInfo]):
+    def insert_symbols(self, file_id: int, symbols: list[SymbolInfo], *, commit: bool = True):
         if not symbols:
             return
         conn = self._conn()
         # Get file path for FTS population
         file_row = conn.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
         file_path = file_row["path"] if file_row else ""
-
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO symbols
-                (symbol_id, file_id, type, short_name, parent, line, end_line, signature)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    s.symbol_id, file_id, s.type, s.name,
-                    s.parent, s.line, s.end_line, s.signature,
-                )
-                for s in symbols
-            ],
-        )
-        # Populate FTS index (INSERT OR IGNORE — won't re-add duplicates)
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature, body_text)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    s.symbol_id,
-                    file_path,
-                    s.name or "",
-                    s.parent or "",
-                    s.signature or "",
-                    s.body_text or "",
-                )
-                for s in symbols
-            ],
-        )
-        conn.commit()
+        self._insert_symbol_rows(conn, file_id, file_path, symbols)
+        self._commit_if_needed(conn, commit)
 
     def persist_file_and_symbols(
         self,
@@ -245,6 +296,7 @@ class SQLiteStore:
         symbols: list[SymbolInfo],
         *,
         replace_existing: bool = False,
+        commit: bool = True,
     ) -> int:
         """
         Persist a file row and its symbols in a single transaction.
@@ -255,8 +307,7 @@ class SQLiteStore:
         conn = self._conn()
 
         if replace_existing:
-            conn.execute("DELETE FROM symbol_fts WHERE file_path=?", (file_info.path,))
-            conn.execute("DELETE FROM files WHERE path=?", (file_info.path,))
+            self._replace_file_rows(conn, file_info.path)
 
         conn.execute(
             """
@@ -269,54 +320,15 @@ class SQLiteStore:
                 imports    = excluded.imports,
                 exports    = excluded.exports
             """,
-            (
-                file_info.path,
-                file_info.language,
-                file_info.line_count,
-                file_info.mtime,
-                json.dumps(file_info.imports),
-                json.dumps(file_info.exports),
-            ),
+            self._file_row_values(file_info),
         )
         row = conn.execute(
             "SELECT id FROM files WHERE path=?", (file_info.path,)
         ).fetchone()
         file_id = row["id"]
+        self._insert_symbol_rows(conn, file_id, file_info.path, symbols)
 
-        if symbols:
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO symbols
-                    (symbol_id, file_id, type, short_name, parent, line, end_line, signature)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        s.symbol_id, file_id, s.type, s.name,
-                        s.parent, s.line, s.end_line, s.signature,
-                    )
-                    for s in symbols
-                ],
-            )
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO symbol_fts(symbol_id, file_path, short_name, parent, signature, body_text)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        s.symbol_id,
-                        file_info.path,
-                        s.name or "",
-                        s.parent or "",
-                        s.signature or "",
-                        s.body_text or "",
-                    )
-                    for s in symbols
-                ],
-            )
-
-        conn.commit()
+        self._commit_if_needed(conn, commit)
         return file_id
 
     def get_symbols_for_file(self, path: str) -> list[dict]:
@@ -405,7 +417,7 @@ class SQLiteStore:
 
     # ── Symbol Embeddings ────────────────────────────────────────────────────
 
-    def upsert_symbol_embedding(self, symbol_id: str, model: str, vector: list[float]):
+    def upsert_symbol_embedding(self, symbol_id: str, model: str, vector: list[float], *, commit: bool = True):
         blob = struct.pack(f"{len(vector)}f", *vector)
         conn = self._conn()
         conn.execute(
@@ -419,9 +431,9 @@ class SQLiteStore:
             """,
             (symbol_id, model, blob, time.time()),
         )
-        conn.commit()
+        self._commit_if_needed(conn, commit)
 
-    def bulk_upsert_symbol_embeddings(self, rows: list[tuple[str, str, list[float]]]):
+    def bulk_upsert_symbol_embeddings(self, rows: list[tuple[str, str, list[float]]], *, commit: bool = True):
         """Upsert many (symbol_id, model, vector) rows in a single transaction."""
         if not rows:
             return
@@ -438,7 +450,7 @@ class SQLiteStore:
             """,
             [(sym_id, model, struct.pack(f"{len(vec)}f", *vec), now) for sym_id, model, vec in rows],
         )
-        conn.commit()
+        self._commit_if_needed(conn, commit)
 
     def get_all_symbol_embeddings(self) -> list[tuple[str, str, str, Optional[str], list[float]]]:
         """Return list of (symbol_id, short_name, file_path, parent, vector) for all embedded symbols."""

@@ -1,6 +1,6 @@
 # 🪸 barnacle-search
 
-A local MCP server that attaches to your codebase and gives Claude semantic search, symbol extraction, and auto-reindexing — no cloud, no API keys.
+A local MCP server that attaches to your codebase and gives Claude Code and Codex semantic search, symbol extraction, and auto-reindexing - no cloud, no API keys.
 
 ## What it does
 
@@ -51,6 +51,11 @@ The setup script will:
 2. Install all Python dependencies
 3. Compile the Dart tree-sitter grammar from source
 4. Register `barnacle-search` as a global MCP server in Claude Code (`~/.claude.json`)
+5. Add a managed `barnacle-search` guidance block to Claude user memory (`~/.claude/CLAUDE.md`) so Claude Code knows when and how to use the server
+6. Register `barnacle-search` as a global MCP server in Codex (`~/.codex/config.toml`)
+7. Add a managed `barnacle-search` guidance block to Codex global instructions (`~/.codex/AGENTS.md`) so exploratory codebase questions bias toward Barnacle first
+
+The setup scripts can also uninstall the MCP registration. They detect whether `barnacle-search` is currently registered in Claude Code, Codex, or both, then let you choose which target to remove. When uninstalling, they remove only the managed `barnacle-search` guidance blocks from `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
 
 ### Ollama (for semantic search)
 
@@ -68,9 +73,9 @@ ollama pull granite-embedding
 
 Barnacle will auto-pull the model if Ollama is running but the model isn't downloaded yet. Structural search (symbols, regex) works fine without Ollama.
 
-## Usage in Claude Code
+## Usage in Claude Code or Codex
 
-After setup, restart Claude Code. Then in any session:
+After setup, restart Claude Code and/or Codex. Then in any session:
 
 ```
 set_project_path("/path/to/your/project")
@@ -78,6 +83,15 @@ build_deep_index()
 ```
 
 `build_deep_index()` only needs to run once — the index updates automatically when files change.
+
+If Codex shows `barnacle-search` as enabled but lists `Tools: (none)`, the MCP process is usually failing before startup because `uv` cannot use its default cache directory inside the Codex sandbox. Ensure your `~/.codex/config.toml` entry includes a writable cache override:
+
+```toml
+[mcp_servers."barnacle-search"]
+command = "uv"
+args = ["--directory", "/absolute/path/to/barnacle-search", "run", "barnacle-search"]
+env = { UV_CACHE_DIR = "/tmp/barnacle-search-uv-cache" }
+```
 
 ## Available tools
 
@@ -92,7 +106,7 @@ build_deep_index()
 | `get_symbol_body(file, symbol)` | Read source of a specific method or class |
 | `get_index_status()` | File count, language breakdown, embedding count |
 
-## Adding to a project's CLAUDE.md
+## Adding to project instructions
 
 To make Claude automatically use barnacle-search in a specific project, add this to your `CLAUDE.md`:
 
@@ -112,6 +126,29 @@ build_deep_index()
 - `get_file_summary(path="...")` — symbols in a file
 - `get_symbol_body(file="...", symbol="MethodName")` — read a method
 ```
+
+To make Codex automatically use barnacle-search in a specific project, add this to your `AGENTS.md`:
+
+```markdown
+## Code Navigation
+
+Use the `barnacle-search` MCP tools to explore this codebase.
+
+### Setup (first time per session)
+set_project_path("/absolute/path/to/project")
+build_deep_index()
+
+### Key tools
+- `semantic_search(query="...")` — find by meaning
+- `find_files(pattern="**/*.cs")` — find by name
+- `search_code(pattern="...")` — find by regex
+- `get_file_summary(path="...")` — symbols in a file
+- `get_symbol_body(file="...", symbol="MethodName")` — read a method
+```
+
+The setup scripts also add a global Codex guidance block under `~/.codex/AGENTS.md` with the same intent, so exploratory codebase questions in any repo can prefer Barnacle first while exact lookups still use `rg`.
+
+For Claude Code, the setup scripts also add a global guidance block under `~/.claude/CLAUDE.md`. This matters because MCP registration makes the server available, but Claude memory is what tells Claude to prefer Barnacle for exploratory codebase work and to call `set_project_path()` before other Barnacle tools.
 
 ## How it works
 

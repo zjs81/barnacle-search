@@ -163,6 +163,51 @@ const formatDate = (d) => d.toISOString();
         _, syms = parse("app.js", self.SOURCE)
         assert "formatDate" in symbol_names(syms)
 
+    def test_extracts_controller_callback_members(self):
+        source = '''\
+angular.module("app").controller("AttachmentsCtrl", function ($scope) {
+    $scope.open = function () { return true; };
+    $scope.save = () => 1;
+});
+'''
+        _, syms = parse("attachments.dlg.controller.js", source)
+        open_sym = next((s for s in syms if s.name == "open"), None)
+        save_sym = next((s for s in syms if s.name == "save"), None)
+        assert open_sym is not None
+        assert save_sym is not None
+        assert open_sym.parent == "AttachmentsCtrl"
+        assert save_sym.parent == "AttachmentsCtrl"
+
+    def test_extracts_object_literal_methods_with_container(self):
+        source = '''\
+const vm = {
+    init() { return 1; },
+    close: function () { return 2; },
+    save: () => 3,
+};
+'''
+        _, syms = parse("view-model.js", source)
+        init_sym = next((s for s in syms if s.name == "init"), None)
+        close_sym = next((s for s in syms if s.name == "close"), None)
+        save_sym = next((s for s in syms if s.name == "save"), None)
+        assert init_sym is not None
+        assert close_sym is not None
+        assert save_sym is not None
+        assert init_sym.parent == "vm"
+        assert close_sym.parent == "vm"
+        assert save_sym.parent == "vm"
+
+    def test_extracts_prototype_assignment_methods(self):
+        source = '''\
+DocumentManager.prototype.open = function(path) {
+    return path;
+};
+'''
+        _, syms = parse("document-manager.js", source)
+        open_sym = next((s for s in syms if s.name == "open"), None)
+        assert open_sym is not None
+        assert open_sym.parent == "DocumentManager"
+
 
 # ── C# ───────────────────────────────────────────────────────────────────────
 

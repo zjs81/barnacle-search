@@ -41,6 +41,7 @@ class ShallowIndex:
     def __init__(self):
         self._entries: list[ShallowEntry] = []
         self._by_path: dict[str, ShallowEntry] = {}
+        self._stats_cache: Optional[dict] = None
 
     def build(self, project_path: str) -> "ShallowIndex":
         """Scan project_path and build the index. Returns self."""
@@ -48,43 +49,43 @@ class ShallowIndex:
         self._by_path = {}
         project_path = os.path.abspath(project_path)
 
-        for dirpath, dirnames, filenames in os.walk(project_path, topdown=True):
-            # Prune excluded directories in-place so os.walk won't descend into them
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in EXCLUDE_DIRS and not d.startswith(".")
-                or d in {".git"} and False  # keep the exclude-all-dot-dirs opt below
-            ]
-            # Re-filter: skip any dir name that starts with "." as well as EXCLUDE_DIRS
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in EXCLUDE_DIRS
-            ]
-
-            for filename in filenames:
-                ext = Path(filename).suffix.lower()
-                if ext not in SUPPORTED_EXTENSIONS:
-                    continue
-
-                abs_path = os.path.join(dirpath, filename)
-                try:
-                    stat = os.stat(abs_path)
-                except OSError:
-                    continue
-
-                rel_path = os.path.relpath(abs_path, project_path).replace("\\", "/")
-                language = _EXT_TO_LANGUAGE[ext]
-                entry = ShallowEntry(
-                    path=abs_path,
-                    rel_path=rel_path,
-                    mtime=stat.st_mtime,
-                    language=language,
-                    size=stat.st_size,
-                )
-                self._entries.append(entry)
-                self._by_path[abs_path] = entry
+        self._scan_dir(project_path, project_path)
+        self._stats_cache = None
 
         return self
+
+    def _scan_dir(self, root_path: str, current_path: str) -> None:
+        try:
+            with os.scandir(current_path) as it:
+                for entry in it:
+                    name = entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        if name.startswith(".") or name in EXCLUDE_DIRS:
+                            continue
+                        self._scan_dir(root_path, entry.path)
+                        continue
+
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext not in SUPPORTED_EXTENSIONS:
+                        continue
+
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+
+                    rel_path = os.path.relpath(entry.path, root_path).replace("\\", "/")
+                    shallow_entry = ShallowEntry(
+                        path=entry.path,
+                        rel_path=rel_path,
+                        mtime=stat.st_mtime,
+                        language=_EXT_TO_LANGUAGE[ext],
+                        size=stat.st_size,
+                    )
+                    self._entries.append(shallow_entry)
+                    self._by_path[entry.path] = shallow_entry
+        except OSError:
+            return
 
     def save(self, cache_path: str):
         """Save to JSON file."""
@@ -103,6 +104,7 @@ class ShallowIndex:
             entry = ShallowEntry(**item)
             self._entries.append(entry)
             self._by_path[entry.path] = entry
+        self._stats_cache = None
         return self
 
     def find_files(self, pattern: str) -> list[str]:
@@ -122,10 +124,13 @@ class ShallowIndex:
 
     def get_stats(self) -> dict:
         """Return {"total": N, "by_language": {...}}"""
+        if self._stats_cache is not None:
+            return self._stats_cache
         by_language: dict[str, int] = {}
-        for e in self._entries:
-            by_language[e.language] = by_language.get(e.language, 0) + 1
-        return {"total": len(self._entries), "by_language": by_language}
+        for entry in self._entries:
+            by_language[entry.language] = by_language.get(entry.language, 0) + 1
+        self._stats_cache = {"total": len(self._entries), "by_language": by_language}
+        return self._stats_cache
 
     def needs_rebuild(self, path: str) -> bool:
         """True if file is new or mtime changed since last index."""
