@@ -8,6 +8,7 @@ $RepoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EmbedModel = "granite-embedding"
 $ClaudeJson = Join-Path $env:USERPROFILE ".claude.json"
 $ClaudeMemory = Join-Path (Join-Path $env:USERPROFILE ".claude") "CLAUDE.md"
+$ClaudeSettings = Join-Path (Join-Path $env:USERPROFILE ".claude") "settings.json"
 $CodexDir = Join-Path $env:USERPROFILE ".codex"
 $CodexToml = Join-Path $CodexDir "config.toml"
 $CodexAgents = Join-Path $CodexDir "AGENTS.md"
@@ -74,6 +75,32 @@ function Remove-ClaudeInstall {
     } else {
         Write-Host "No barnacle-search guidance block found in $ClaudeMemory"
     }
+
+    if (-not (Test-Path $ClaudeSettings)) {
+        Write-Host "Claude settings not found; nothing to remove."
+        return
+    }
+
+    $settingsConfig = Get-Content $ClaudeSettings -Raw | ConvertFrom-Json
+    if ($settingsConfig -and ($settingsConfig.PSObject.Properties.Name -contains "permissions")) {
+        $permissions = $settingsConfig.permissions
+        if ($permissions -and ($permissions.PSObject.Properties.Name -contains "allow")) {
+            $allow = @($permissions.allow) | Where-Object {
+                $_ -ne "mcp__barnacle-search" -and $_ -ne "mcp__barnacle-search__*"
+            }
+            if ($allow.Count -gt 0) {
+                $permissions.allow = $allow
+            } else {
+                $permissions.PSObject.Properties.Remove("allow")
+            }
+        }
+        if (-not @($permissions.PSObject.Properties.Name).Count) {
+            $settingsConfig.PSObject.Properties.Remove("permissions")
+        }
+    }
+
+    $settingsConfig | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettings -Encoding UTF8
+    Write-Host "Removed barnacle-search MCP permission from $ClaudeSettings"
 }
 
 function Remove-CodexInstall {
@@ -326,6 +353,28 @@ If Barnacle results are low-signal, the index is not ready, or the task is an ex
 
     $updatedMemoryConfig | Set-Content $ClaudeMemory -Encoding UTF8
     Write-Host "Registered barnacle-search guidance in $ClaudeMemory"
+
+    if (Test-Path $ClaudeSettings) {
+        $settingsConfig = Get-Content $ClaudeSettings -Raw | ConvertFrom-Json
+    } else {
+        $settingsConfig = [PSCustomObject]@{}
+    }
+
+    if (-not ($settingsConfig.PSObject.Properties.Name -contains "permissions")) {
+        $settingsConfig | Add-Member -MemberType NoteProperty -Name "permissions" -Value ([PSCustomObject]@{})
+    }
+    if (-not ($settingsConfig.permissions.PSObject.Properties.Name -contains "allow")) {
+        $settingsConfig.permissions | Add-Member -MemberType NoteProperty -Name "allow" -Value @()
+    }
+
+    $allowRules = @($settingsConfig.permissions.allow)
+    if ($allowRules -notcontains "mcp__barnacle-search") {
+        $allowRules += "mcp__barnacle-search"
+    }
+    $settingsConfig.permissions.allow = $allowRules
+
+    $settingsConfig | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettings -Encoding UTF8
+    Write-Host "Registered barnacle-search MCP permission in $ClaudeSettings"
 }
 
 # ── 7. Register MCP server in Codex ───────────────────────────────────────────

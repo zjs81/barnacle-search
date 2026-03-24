@@ -52,10 +52,11 @@ The setup script will:
 3. Compile the Dart tree-sitter grammar from source
 4. Register `barnacle-search` as a global MCP server in Claude Code (`~/.claude.json`)
 5. Add a managed `barnacle-search` guidance block to Claude user memory (`~/.claude/CLAUDE.md`) so Claude Code knows when and how to use the server
-6. Register `barnacle-search` as a global MCP server in Codex (`~/.codex/config.toml`)
-7. Add a managed `barnacle-search` guidance block to Codex global instructions (`~/.codex/AGENTS.md`) so exploratory codebase questions bias toward Barnacle first
+6. Add a Claude permission allow rule for the Barnacle MCP server (`~/.claude/settings.json`) so Claude can call its tools without prompting on first use
+7. Register `barnacle-search` as a global MCP server in Codex (`~/.codex/config.toml`)
+8. Add a managed `barnacle-search` guidance block to Codex global instructions (`~/.codex/AGENTS.md`) so exploratory codebase questions bias toward Barnacle first
 
-The setup scripts can also uninstall the MCP registration. They detect whether `barnacle-search` is currently registered in Claude Code, Codex, or both, then let you choose which target to remove. When uninstalling, they remove only the managed `barnacle-search` guidance blocks from `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
+The setup scripts can also uninstall the MCP registration. They detect whether `barnacle-search` is currently registered in Claude Code, Codex, or both, then let you choose which target to remove. When uninstalling, they remove only the managed `barnacle-search` guidance blocks from `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`, plus the Claude permission rule from `~/.claude/settings.json`.
 
 ### Ollama (for semantic search)
 
@@ -149,6 +150,8 @@ build_deep_index()
 The setup scripts also add a global Codex guidance block under `~/.codex/AGENTS.md` with the same intent, so exploratory codebase questions in any repo can prefer Barnacle first while exact lookups still use `rg`.
 
 For Claude Code, the setup scripts also add a global guidance block under `~/.claude/CLAUDE.md`. This matters because MCP registration makes the server available, but Claude memory is what tells Claude to prefer Barnacle for exploratory codebase work and to call `set_project_path()` before other Barnacle tools.
+
+They also add `mcp__barnacle-search` to `~/.claude/settings.json` under `permissions.allow`, which follows Claude Code's MCP permission syntax for allowing all tools from a specific MCP server.
 
 ## How it works
 

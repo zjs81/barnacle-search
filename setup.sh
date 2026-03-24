@@ -6,6 +6,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EMBED_MODEL="granite-embedding"
 CLAUDE_JSON="$HOME/.claude.json"
 CLAUDE_MEMORY="$HOME/.claude/CLAUDE.md"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CODEX_TOML="$HOME/.codex/config.toml"
 CODEX_AGENTS="$HOME/.codex/AGENTS.md"
 
@@ -150,6 +151,37 @@ else:
     os.remove(claude_memory)
 
 print("Removed barnacle-search guidance from", claude_memory if count else f"{claude_memory} (no existing block)")
+PYEOF
+
+    python3 - <<'PYEOF'
+import json
+import os
+
+claude_settings = os.path.expanduser("~/.claude/settings.json")
+if not os.path.exists(claude_settings):
+    print("Claude settings not found; nothing to remove.")
+    raise SystemExit(0)
+
+with open(claude_settings, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+permissions = config.get("permissions")
+if isinstance(permissions, dict):
+    allow = permissions.get("allow")
+    if isinstance(allow, list):
+        allow = [rule for rule in allow if rule not in ("mcp__barnacle-search", "mcp__barnacle-search__*")]
+        if allow:
+            permissions["allow"] = allow
+        else:
+            permissions.pop("allow", None)
+    if not permissions:
+        config.pop("permissions", None)
+
+with open(claude_settings, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+
+print("Removed barnacle-search MCP permission from", claude_settings)
 PYEOF
 }
 
@@ -395,6 +427,31 @@ with open(claude_memory, "w", encoding="utf-8") as f:
     f.write(updated)
 
 print("Registered barnacle-search guidance in", claude_memory)
+PYEOF
+
+    python3 - <<'PYEOF'
+import json
+import os
+
+claude_settings = os.path.expanduser("~/.claude/settings.json")
+os.makedirs(os.path.dirname(claude_settings), exist_ok=True)
+
+if os.path.exists(claude_settings):
+    with open(claude_settings, "r", encoding="utf-8") as f:
+        config = json.load(f)
+else:
+    config = {}
+
+permissions = config.setdefault("permissions", {})
+allow = permissions.setdefault("allow", [])
+if "mcp__barnacle-search" not in allow:
+    allow.append("mcp__barnacle-search")
+
+with open(claude_settings, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+
+print("Registered barnacle-search MCP permission in", claude_settings)
 PYEOF
 fi
 fi
