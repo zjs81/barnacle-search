@@ -1,6 +1,6 @@
 # 🪸 barnacle-search
 
-A local MCP server that attaches to your codebase and gives Claude Code and Codex semantic search, symbol extraction, and auto-reindexing - no cloud, no API keys.
+A local MCP server that attaches to your codebase and gives Claude Code, Codex, and OpenCode semantic search, symbol extraction, and auto-reindexing - no cloud, no API keys.
 
 ## What it does
 
@@ -55,8 +55,10 @@ The setup script will:
 6. Add a Claude permission allow rule for the Barnacle MCP server (`~/.claude/settings.json`) so Claude can call its tools without prompting on first use
 7. Register `barnacle-search` as a global MCP server in Codex (`~/.codex/config.toml`)
 8. Add a managed `barnacle-search` guidance block to Codex global instructions (`~/.codex/AGENTS.md`) so exploratory codebase questions bias toward Barnacle first
+9. Register `barnacle-search` as a global MCP server in OpenCode (`~/.config/opencode/opencode.json`)
+10. Add a managed `barnacle-search` guidance block to OpenCode global instructions (`~/.config/opencode/AGENTS.md`)
 
-The setup scripts can also uninstall the MCP registration. They detect whether `barnacle-search` is currently registered in Claude Code, Codex, or both, then let you choose which target to remove. When uninstalling, they remove only the managed `barnacle-search` guidance blocks from `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`, plus the Claude permission rule from `~/.claude/settings.json`.
+The setup scripts can also uninstall the MCP registration. They detect whether `barnacle-search` is currently registered in Claude Code, Codex, OpenCode, or any combination, then let you choose which target to remove. When uninstalling, they remove only the managed `barnacle-search` guidance blocks from `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `~/.config/opencode/AGENTS.md`, plus the Claude permission rule from `~/.claude/settings.json`.
 
 ### Ollama (for semantic search)
 
@@ -74,9 +76,9 @@ ollama pull granite-embedding
 
 Barnacle will auto-pull the model if Ollama is running but the model isn't downloaded yet. Structural search (symbols, regex) works fine without Ollama.
 
-## Usage in Claude Code or Codex
+## Usage in Claude Code, Codex, or OpenCode
 
-After setup, restart Claude Code and/or Codex. Then in any session:
+After setup, restart Claude Code, Codex, and/or OpenCode. Then in any session:
 
 ```
 set_project_path("/path/to/your/project")
@@ -92,6 +94,24 @@ If Codex shows `barnacle-search` as enabled but lists `Tools: (none)`, the MCP p
 command = "uv"
 args = ["--directory", "/absolute/path/to/barnacle-search", "run", "barnacle-search"]
 env = { UV_CACHE_DIR = "/tmp/barnacle-search-uv-cache" }
+```
+
+For OpenCode, add the MCP server under `mcp` in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "barnacle-search": {
+      "type": "local",
+      "command": ["uv", "--directory", "/absolute/path/to/barnacle-search", "run", "barnacle-search"],
+      "enabled": true,
+      "environment": {
+        "UV_CACHE_DIR": "/tmp/barnacle-search-uv-cache"
+      }
+    }
+  }
+}
 ```
 
 ## Available tools
@@ -121,14 +141,14 @@ set_project_path("/absolute/path/to/project")
 build_deep_index()
 
 ### Key tools
-- `semantic_search(query="...")` — find by meaning
+- Start with `semantic_search(query="...")` for exploratory questions — find by meaning
 - `find_files(pattern="**/*.cs")` — find by name
 - `search_code(pattern="...")` — find by regex
 - `get_file_summary(path="...")` — symbols in a file
 - `get_symbol_body(file="...", symbol="MethodName")` — read a method
 ```
 
-To make Codex automatically use barnacle-search in a specific project, add this to your `AGENTS.md`:
+To make Codex or OpenCode automatically use barnacle-search in a specific project, add this to your `AGENTS.md`:
 
 ```markdown
 ## Code Navigation
@@ -140,18 +160,20 @@ set_project_path("/absolute/path/to/project")
 build_deep_index()
 
 ### Key tools
-- `semantic_search(query="...")` — find by meaning
+- Start with `semantic_search(query="...")` for exploratory questions — find by meaning
 - `find_files(pattern="**/*.cs")` — find by name
 - `search_code(pattern="...")` — find by regex
 - `get_file_summary(path="...")` — symbols in a file
 - `get_symbol_body(file="...", symbol="MethodName")` — read a method
 ```
 
-The setup scripts also add a global Codex guidance block under `~/.codex/AGENTS.md` with the same intent, so exploratory codebase questions in any repo can prefer Barnacle first while exact lookups still use `rg`.
+The setup scripts also add global guidance blocks under `~/.codex/AGENTS.md` and `~/.config/opencode/AGENTS.md` with the same intent, so exploratory codebase questions in any repo can prefer Barnacle first while exact lookups still use `rg`.
 
 For Claude Code, the setup scripts also add a global guidance block under `~/.claude/CLAUDE.md`. This matters because MCP registration makes the server available, but Claude memory is what tells Claude to prefer Barnacle for exploratory codebase work and to call `set_project_path()` before other Barnacle tools.
 
 They also add `mcp__barnacle-search` to `~/.claude/settings.json` under `permissions.allow`, which follows Claude Code's MCP permission syntax for allowing all tools from a specific MCP server.
+
+OpenCode supports `AGENTS.md` natively and its config is merged from `~/.config/opencode/opencode.json` plus project settings, so the dedicated OpenCode registration keeps Barnacle available even when Claude-specific files are absent.
 
 ## How it works
 

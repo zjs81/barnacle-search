@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Setup barnacle-search and register it as a global MCP server in Claude Code and Codex.
+# Setup barnacle-search and register it as a global MCP server in Claude Code, Codex, and OpenCode.
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,6 +9,9 @@ CLAUDE_MEMORY="$HOME/.claude/CLAUDE.md"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CODEX_TOML="$HOME/.codex/config.toml"
 CODEX_AGENTS="$HOME/.codex/AGENTS.md"
+OPENCODE_DIR="$HOME/.config/opencode"
+OPENCODE_CONFIG="$OPENCODE_DIR/opencode.json"
+OPENCODE_AGENTS="$OPENCODE_DIR/AGENTS.md"
 
 detect_claude_install() {
     if [[ ! -f "$CLAUDE_JSON" ]] || ! command -v python3 &>/dev/null; then
@@ -33,6 +36,39 @@ detect_codex_install() {
     [[ -f "$CODEX_TOML" ]] && rg -q '^\[mcp_servers\."barnacle-search"\]$' "$CODEX_TOML"
 }
 
+detect_opencode_install() {
+    if [[ ! -f "$OPENCODE_CONFIG" ]] || ! command -v python3 &>/dev/null; then
+        return 1
+    fi
+
+    python3 - <<'PYEOF' >/dev/null 2>&1
+import json
+import os
+import re
+
+def strip_jsonc(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"(^|[^:])//.*$", r"\1", text, flags=re.M)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+path = os.path.expanduser("~/.config/opencode/opencode.json")
+with open(path, "r", encoding="utf-8") as f:
+    config = json.loads(strip_jsonc(f.read()) or "{}")
+
+if "barnacle-search" in config.get("mcp", {}):
+    raise SystemExit(0)
+raise SystemExit(1)
+PYEOF
+}
+
+target_has() {
+    case ",$1," in
+        *",$2,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 prompt_install_target() {
     INSTALL_TARGET=""
     while [[ -z "$INSTALL_TARGET" ]]; do
@@ -40,13 +76,21 @@ prompt_install_target() {
         echo "Register barnacle-search for:"
         echo "  1) Claude Code"
         echo "  2) Codex"
-        echo "  3) Both"
-        read -r -p "Choose 1, 2, or 3 [3]: " choice
-        choice="${choice:-3}"
+        echo "  3) OpenCode"
+        echo "  4) Claude Code + Codex"
+        echo "  5) Claude Code + OpenCode"
+        echo "  6) Codex + OpenCode"
+        echo "  7) All"
+        read -r -p "Choose 1-7 [7]: " choice
+        choice="${choice:-7}"
         case "$choice" in
             1) INSTALL_TARGET="claude" ;;
             2) INSTALL_TARGET="codex" ;;
-            3) INSTALL_TARGET="both" ;;
+            3) INSTALL_TARGET="opencode" ;;
+            4) INSTALL_TARGET="claude,codex" ;;
+            5) INSTALL_TARGET="claude,opencode" ;;
+            6) INSTALL_TARGET="codex,opencode" ;;
+            7) INSTALL_TARGET="claude,codex,opencode" ;;
             *)
                 echo "Invalid choice: $choice" >&2
                 ;;
@@ -57,22 +101,29 @@ prompt_install_target() {
 prompt_uninstall_target() {
     local claude_installed="$1"
     local codex_installed="$2"
+    local opencode_installed="$3"
     UNINSTALL_TARGET=""
 
-    if [[ "$claude_installed" == "0" && "$codex_installed" == "0" ]]; then
-        echo "barnacle-search is not registered in Claude Code or Codex."
+    if [[ "$claude_installed" == "0" && "$codex_installed" == "0" && "$opencode_installed" == "0" ]]; then
+        echo "barnacle-search is not registered in Claude Code, Codex, or OpenCode."
         exit 0
     fi
 
-    if [[ "$claude_installed" == "1" && "$codex_installed" == "0" ]]; then
+    if [[ "$claude_installed" == "1" && "$codex_installed" == "0" && "$opencode_installed" == "0" ]]; then
         echo "Detected barnacle-search registration in Claude Code only."
         UNINSTALL_TARGET="claude"
         return
     fi
 
-    if [[ "$claude_installed" == "0" && "$codex_installed" == "1" ]]; then
+    if [[ "$claude_installed" == "0" && "$codex_installed" == "1" && "$opencode_installed" == "0" ]]; then
         echo "Detected barnacle-search registration in Codex only."
         UNINSTALL_TARGET="codex"
+        return
+    fi
+
+    if [[ "$claude_installed" == "0" && "$codex_installed" == "0" && "$opencode_installed" == "1" ]]; then
+        echo "Detected barnacle-search registration in OpenCode only."
+        UNINSTALL_TARGET="opencode"
         return
     fi
 
@@ -81,13 +132,21 @@ prompt_uninstall_target() {
         echo "Uninstall barnacle-search from:"
         echo "  1) Claude Code"
         echo "  2) Codex"
-        echo "  3) Both"
-        read -r -p "Choose 1, 2, or 3 [3]: " choice
-        choice="${choice:-3}"
+        echo "  3) OpenCode"
+        echo "  4) Claude Code + Codex"
+        echo "  5) Claude Code + OpenCode"
+        echo "  6) Codex + OpenCode"
+        echo "  7) All"
+        read -r -p "Choose 1-7 [7]: " choice
+        choice="${choice:-7}"
         case "$choice" in
             1) UNINSTALL_TARGET="claude" ;;
             2) UNINSTALL_TARGET="codex" ;;
-            3) UNINSTALL_TARGET="both" ;;
+            3) UNINSTALL_TARGET="opencode" ;;
+            4) UNINSTALL_TARGET="claude,codex" ;;
+            5) UNINSTALL_TARGET="claude,opencode" ;;
+            6) UNINSTALL_TARGET="codex,opencode" ;;
+            7) UNINSTALL_TARGET="claude,codex,opencode" ;;
             *)
                 echo "Invalid choice: $choice" >&2
                 ;;
@@ -250,13 +309,88 @@ print("Removed barnacle-search guidance from", codex_agents if count else f"{cod
 PYEOF
 }
 
+uninstall_opencode() {
+    if [[ ! -f "$OPENCODE_CONFIG" ]]; then
+        echo "OpenCode config not found; nothing to remove."
+    elif ! command -v python3 &>/dev/null; then
+        echo "Warning: python3 not found - skipping OpenCode uninstall." >&2
+    else
+        python3 - <<'PYEOF'
+import json
+import os
+import re
+
+def strip_jsonc(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"(^|[^:])//.*$", r"\1", text, flags=re.M)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+opencode_config = os.path.expanduser("~/.config/opencode/opencode.json")
+with open(opencode_config, "r", encoding="utf-8") as f:
+    config = json.loads(strip_jsonc(f.read()) or "{}")
+
+mcp = config.get("mcp")
+removed = False
+if isinstance(mcp, dict) and "barnacle-search" in mcp:
+    removed = mcp.pop("barnacle-search", None) is not None
+    if not mcp:
+        config.pop("mcp", None)
+
+with open(opencode_config, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+
+print("Removed barnacle-search from", opencode_config if removed else f"{opencode_config} (no existing entry)")
+PYEOF
+    fi
+
+    if [[ ! -f "$OPENCODE_AGENTS" ]]; then
+        echo "OpenCode AGENTS not found; nothing to remove."
+        return
+    fi
+
+    if ! command -v python3 &>/dev/null; then
+        echo "Warning: python3 not found - skipping OpenCode AGENTS cleanup." >&2
+        return
+    fi
+
+    python3 - <<'PYEOF'
+import os
+import re
+
+opencode_agents = os.path.expanduser("~/.config/opencode/AGENTS.md")
+with open(opencode_agents, "r", encoding="utf-8") as f:
+    existing = f.read()
+
+pattern = re.compile(
+    r'(?ms)\n?<!-- barnacle-search:opencode-guidance:start -->\n.*?<!-- barnacle-search:opencode-guidance:end -->\n?'
+)
+updated, count = pattern.subn("\n", existing)
+updated = updated.strip()
+
+if updated:
+    updated += "\n"
+    with open(opencode_agents, "w", encoding="utf-8") as f:
+        f.write(updated)
+else:
+    os.remove(opencode_agents)
+
+print("Removed barnacle-search guidance from", opencode_agents if count else f"{opencode_agents} (no existing block)")
+PYEOF
+}
+
 CLAUDE_INSTALLED=0
 CODEX_INSTALLED=0
+OPENCODE_INSTALLED=0
 if detect_claude_install; then
     CLAUDE_INSTALLED=1
 fi
 if detect_codex_install; then
     CODEX_INSTALLED=1
+fi
+if detect_opencode_install; then
+    OPENCODE_INSTALLED=1
 fi
 
 echo "Current MCP registration status:"
@@ -269,6 +403,11 @@ if [[ "$CODEX_INSTALLED" == "1" ]]; then
     echo "  Codex: installed"
 else
     echo "  Codex: not installed"
+fi
+if [[ "$OPENCODE_INSTALLED" == "1" ]]; then
+    echo "  OpenCode: installed"
+else
+    echo "  OpenCode: not installed"
 fi
 
 ACTION=""
@@ -289,19 +428,23 @@ while [[ -z "$ACTION" ]]; do
 done
 
 if [[ "$ACTION" == "uninstall" ]]; then
-    prompt_uninstall_target "$CLAUDE_INSTALLED" "$CODEX_INSTALLED"
+    prompt_uninstall_target "$CLAUDE_INSTALLED" "$CODEX_INSTALLED" "$OPENCODE_INSTALLED"
 
-    if [[ "$UNINSTALL_TARGET" == "claude" || "$UNINSTALL_TARGET" == "both" ]]; then
+    if target_has "$UNINSTALL_TARGET" "claude"; then
         uninstall_claude
     fi
 
-    if [[ "$UNINSTALL_TARGET" == "codex" || "$UNINSTALL_TARGET" == "both" ]]; then
+    if target_has "$UNINSTALL_TARGET" "codex"; then
         uninstall_codex
+    fi
+
+    if target_has "$UNINSTALL_TARGET" "opencode"; then
+        uninstall_opencode
     fi
 
     echo ""
     echo "barnacle-search uninstall complete."
-    echo "Restart Claude Code and/or Codex if they are currently running."
+    echo "Restart Claude Code, Codex, and/or OpenCode if they are currently running."
     exit 0
 fi
 
@@ -344,7 +487,7 @@ prompt_install_target
 
 # ── 6. Register MCP server in Claude Code ─────────────────────────────────────
 
-if [[ "$INSTALL_TARGET" == "claude" || "$INSTALL_TARGET" == "both" ]]; then
+if target_has "$INSTALL_TARGET" "claude"; then
 if ! command -v python3 &>/dev/null; then
     echo "Warning: python3 not found — skipping Claude Code MCP registration." >&2
     echo "Manually add barnacle-search to your Claude Code MCP config." >&2
@@ -395,7 +538,7 @@ For exploratory codebase questions in a repository, use the `barnacle-search` MC
 Required workflow:
 1. Call `set_project_path("/absolute/path/to/repo")` before any other Barnacle tool.
 2. If the deep index has not been built yet, call `build_deep_index()` when semantic or symbol-aware search will help.
-3. Start exploration with `semantic_search(query="...")` for feature or behavior questions, or `search_code(pattern="...")` / `find_files(pattern="...")` when you already have strong terms.
+3. Start exploratory work with `semantic_search(query="...")` by default. Use `search_code(pattern="...")` or `find_files(pattern="...")` first only when you already have a strong exact term, identifier, string, or path pattern.
 4. Narrow with `get_file_summary(path="...")` and then read exact implementations with `get_symbol_body(file="...", symbol="...")`.
 5. Use shell search only after Barnacle has narrowed the area, or immediately for exact identifier, exact string, or exact path lookup.
 
@@ -458,7 +601,7 @@ fi
 
 # ── 7. Register MCP server in Codex ───────────────────────────────────────────
 
-if [[ "$INSTALL_TARGET" == "codex" || "$INSTALL_TARGET" == "both" ]]; then
+if target_has "$INSTALL_TARGET" "codex"; then
 if ! command -v python3 &>/dev/null; then
     echo "Warning: python3 not found - skipping Codex MCP registration." >&2
     echo "Manually add barnacle-search to your Codex MCP config." >&2
@@ -514,7 +657,7 @@ For exploratory codebase questions in a repository, use the `barnacle-search` MC
 Required workflow:
 1. Call `set_project_path("/absolute/path/to/repo")` before any other Barnacle tool.
 2. If the deep index has not been built yet, call `build_deep_index()` when semantic or symbol-aware search will help.
-3. Start exploration with `semantic_search(query="...")` for feature or behavior questions, or `search_code(pattern="...")` / `find_files(pattern="...")` when you already have strong terms.
+3. Start exploratory work with `semantic_search(query="...")` by default. Use `search_code(pattern="...")` or `find_files(pattern="...")` first only when you already have a strong exact term, identifier, string, or path pattern.
 4. Narrow with `get_file_summary(path="...")` and then read exact implementations with `get_symbol_body(file="...", symbol="...")`.
 5. Use `rg` and `rg --files` only after Barnacle has narrowed the area, or immediately for exact identifier, exact string, or exact path lookup.
 
@@ -550,7 +693,107 @@ PYEOF
 fi
 fi
 
-# ── 8. Pull Ollama embedding model if available ───────────────────────────────
+# ── 8. Register MCP server in OpenCode ───────────────────────────────────────
+
+if target_has "$INSTALL_TARGET" "opencode"; then
+if ! command -v python3 &>/dev/null; then
+    echo "Warning: python3 not found - skipping OpenCode MCP registration." >&2
+    echo "Manually add barnacle-search to your OpenCode config." >&2
+else
+    BARNACLE_REPO_DIR="$REPO_DIR" python3 - <<'PYEOF'
+import json
+import os
+import re
+import shutil
+
+def strip_jsonc(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"(^|[^:])//.*$", r"\1", text, flags=re.M)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+opencode_config = os.path.expanduser("~/.config/opencode/opencode.json")
+os.makedirs(os.path.dirname(opencode_config), exist_ok=True)
+repo_dir = os.environ["BARNACLE_REPO_DIR"]
+
+if os.path.exists(opencode_config):
+    with open(opencode_config, "r", encoding="utf-8") as f:
+        config = json.loads(strip_jsonc(f.read()) or "{}")
+else:
+    config = {}
+
+config.setdefault("$schema", "https://opencode.ai/config.json")
+config.setdefault("mcp", {})
+
+uv_path = shutil.which("uv") or "uv"
+config["mcp"]["barnacle-search"] = {
+    "type": "local",
+    "command": [uv_path, "--directory", repo_dir, "run", "barnacle-search"],
+    "enabled": True,
+    "environment": {
+        "UV_CACHE_DIR": "/tmp/barnacle-search-uv-cache"
+    }
+}
+
+with open(opencode_config, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+
+print("Registered barnacle-search in", opencode_config)
+PYEOF
+
+    python3 - <<'PYEOF'
+import os
+import re
+
+opencode_agents = os.path.expanduser("~/.config/opencode/AGENTS.md")
+os.makedirs(os.path.dirname(opencode_agents), exist_ok=True)
+
+block = """<!-- barnacle-search:opencode-guidance:start -->
+## Barnacle Search
+
+For exploratory codebase questions in a repository, use the `barnacle-search` MCP tools before shell search.
+
+Required workflow:
+1. Call `set_project_path("/absolute/path/to/repo")` before any other Barnacle tool.
+2. If the deep index has not been built yet, call `build_deep_index()` when semantic or symbol-aware search will help.
+3. Start exploratory work with `semantic_search(query="...")` by default. Use `search_code(pattern="...")` or `find_files(pattern="...")` first only when you already have a strong exact term, identifier, string, or path pattern.
+4. Narrow with `get_file_summary(path="...")` and then read exact implementations with `get_symbol_body(file="...", symbol="...")`.
+5. Use shell search only after Barnacle has narrowed the area, or immediately for exact identifier, exact string, or exact path lookup.
+
+Never call `get_index_status()`, `semantic_search()`, `find_files()`, `search_code()`, `get_file_summary()`, or `get_symbol_body()` before `set_project_path()`.
+
+If Barnacle results are low-signal, the index is not ready, or the task is an exact string/path lookup, fall back to shell search immediately.
+<!-- barnacle-search:opencode-guidance:end -->
+"""
+
+existing = ""
+if os.path.exists(opencode_agents):
+    with open(opencode_agents, "r", encoding="utf-8") as f:
+        existing = f.read()
+
+pattern = re.compile(
+    r'(?ms)<!-- barnacle-search:opencode-guidance:start -->\n.*?<!-- barnacle-search:opencode-guidance:end -->'
+)
+
+if pattern.search(existing):
+    updated = pattern.sub(block, existing).strip() + "\n"
+else:
+    prefix = existing.rstrip()
+    if prefix:
+        updated = prefix + "\n\n" + block + "\n"
+    else:
+        updated = block + "\n"
+
+with open(opencode_agents, "w", encoding="utf-8") as f:
+    f.write(updated)
+
+print("Registered barnacle-search guidance in", opencode_agents)
+PYEOF
+fi
+fi
+
+# ── 9. Pull Ollama embedding model if available ───────────────────────────────
 
 if command -v ollama &>/dev/null; then
     echo "Pulling Ollama embedding model ($EMBED_MODEL)..."
@@ -559,13 +802,13 @@ else
     echo "Ollama not found; skipping model pull."
 fi
 
-# ── 9. Done ───────────────────────────────────────────────────────────────────
+# ── 10. Done ──────────────────────────────────────────────────────────────────
 
 echo ""
 echo "barnacle-search is ready!"
 echo ""
 echo "Next steps:"
-echo "  1. Restart Claude Code and/or Codex to pick up the new MCP server"
+echo "  1. Restart Claude Code, Codex, and/or OpenCode to pick up the new MCP server"
 echo "  2. In any project, run:"
 echo "       set_project_path(\"/path/to/your/project\")"
 echo "       build_deep_index()"

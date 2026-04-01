@@ -3,7 +3,7 @@
 import pytest
 
 from code_indexer.embeddings.vector_store import VectorStore, cosine_similarity
-from code_indexer.indexing.sqlite_store import SQLiteStore
+from code_indexer.indexing.snapshot_store import SnapshotStore
 from code_indexer.models.file_info import FileInfo
 from code_indexer.models.symbol_info import SymbolInfo
 
@@ -37,8 +37,8 @@ class TestCosineSimilarity:
 
 @pytest.fixture
 def populated_store(tmp_path):
-    """SQLiteStore + VectorStore with 3 files and symbols pre-loaded."""
-    db = SQLiteStore(str(tmp_path / "test.db"))
+    """SnapshotStore + VectorStore with 3 files and symbols pre-loaded."""
+    db = SnapshotStore(str(tmp_path / "test.bin"))
     vs = VectorStore(db)
 
     files = [
@@ -109,12 +109,12 @@ class TestVectorStoreSearch:
         assert scores == sorted(scores, reverse=True)
 
     def test_empty_store_returns_empty(self, tmp_path):
-        db = SQLiteStore(str(tmp_path / "empty.db"))
+        db = SnapshotStore(str(tmp_path / "empty.bin"))
         vs = VectorStore(db)
         assert vs.search([1.0, 0.0]) == []
 
     def test_matched_symbols_capped_at_5(self, tmp_path):
-        db = SQLiteStore(str(tmp_path / "big.db"))
+        db = SnapshotStore(str(tmp_path / "big.bin"))
         vs = VectorStore(db)
         fi = FileInfo(path="/p/big.py", language="python", line_count=100, mtime=0.0)
         fid = db.upsert_file(fi)
@@ -145,9 +145,9 @@ class TestVectorStoreSearch:
         cosine_auth_rank = cosine_files.index("/p/auth.py")
         assert hybrid_auth_rank <= cosine_auth_rank
 
-    def test_hybrid_with_no_fts_match_falls_back_to_cosine(self, populated_store):
+    def test_hybrid_with_no_keyword_match_falls_back_to_cosine(self, populated_store):
         vs, _ = populated_store
-        # Query text that won't match anything in FTS
+        # Query text that won't match anything in the keyword index
         results = vs.search([1.0, 0.0], top_k=3, query_text="xyzzy_no_match_12345")
         assert len(results) > 0
         assert results[0]["file"] == "/p/auth.py"

@@ -10,10 +10,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Optional
 
-from ..constants import EXCLUDE_DIRS, INDEX_MAX_WORKERS, SUPPORTED_EXTENSIONS
+from ..constants import EXCLUDE_DIRS, INDEX_MAX_WORKERS, MTIME_PRECISION_DIGITS, SUPPORTED_EXTENSIONS
 from ..models.file_info import FileInfo
 from ..models.symbol_info import SymbolInfo
-from .sqlite_store import SQLiteStore
+from .snapshot_store import SnapshotStore
 
 if TYPE_CHECKING:
     from ..indexing.strategies.base import ParsingStrategy  # noqa: F401
@@ -25,11 +25,11 @@ _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
 class IndexBuilder:
-    def __init__(self, project_path: str, store: SQLiteStore, factory):
+    def __init__(self, project_path: str, store: SnapshotStore, factory):
         """
         Args:
             project_path: Root directory to index.
-            store: SQLiteStore instance.
+            store: SnapshotStore instance.
             factory: StrategyFactory — must implement get_strategy(file_path) -> Optional[ParsingStrategy].
         """
         self.project_path = os.path.abspath(project_path)
@@ -96,6 +96,7 @@ class IndexBuilder:
 
         try:
             file_info = strategy.parse_file(file_path, content)
+            file_info.mtime = self._normalize_mtime(file_info.mtime)
             self._populate_symbol_bodies(file_info.symbols, content)
         except Exception as exc:
             log.warning("Parse error for %s: %s", file_path, exc)
@@ -118,7 +119,7 @@ class IndexBuilder:
                 path=file_path,
                 language=language,
                 line_count=content.count("\n") + 1,
-                mtime=mtime,
+                mtime=self._normalize_mtime(mtime),
                 error=str(exc),
             )
 
@@ -201,10 +202,13 @@ class IndexBuilder:
                             stat = entry.stat(follow_symlinks=False)
                         except OSError:
                             continue
-                        result.append((entry.path, stat.st_mtime))
+                        result.append((entry.path, self._normalize_mtime(stat.st_mtime)))
             except OSError:
                 continue
         return result
+
+    def _normalize_mtime(self, value: float) -> float:
+        return round(float(value), MTIME_PRECISION_DIGITS)
 
     def build_embed_text(self, file_path: str, file_info: FileInfo) -> str:
         """
@@ -272,21 +276,24 @@ class IndexBuilder:
 
         # Include the symbol body for semantic content, capped to roughly
         # 510 tokens so giant methods do not dominate embedding latency.
-        start_line = sym.get("line")
-        end_line = sym.get("end_line")
-        if start_line is not None:
-            try:
-                if file_lines is None:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
-                        file_lines = fh.readlines()
-                start_idx = start_line - 1
-                end_idx = end_line or start_line
-                body = "".join(file_lines[start_idx:end_idx]).strip()
-                body = self._truncate_body_tokens(body, _EMBED_BODY_MAX_TOKENS)
-                if body:
-                    lines.append(body)
-            except OSError:
-                pass
+        body = (sym.get("body_text") or "").strip()
+        if not body:
+            start_line = sym.get("line")
+            end_line = sym.get("end_line")
+            if start_line is not None:
+                try:
+                    if file_lines is None:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                            file_lines = fh.readlines()
+                    start_idx = start_line - 1
+                    end_idx = end_line or start_line
+                    body = "".join(file_lines[start_idx:end_idx]).strip()
+                except OSError:
+                    body = ""
+
+        body = self._truncate_body_tokens(body, _EMBED_BODY_MAX_TOKENS)
+        if body:
+            lines.append(body)
 
         return "\n".join(lines)
 

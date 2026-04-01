@@ -1,6 +1,6 @@
 """
 Lightweight JSON file cache of all project file paths, mtimes, and languages.
-Used for fast file listing without opening SQLite.
+Used for fast file listing without touching the deep-index snapshot.
 """
 
 import fnmatch

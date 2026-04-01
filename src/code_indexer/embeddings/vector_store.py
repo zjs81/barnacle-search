@@ -1,5 +1,5 @@
 import math
-from ..indexing.sqlite_store import SQLiteStore
+from ..indexing.snapshot_store import SnapshotStore
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -18,19 +18,26 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 class VectorStore:
-    def __init__(self, store: SQLiteStore):
+    def __init__(self, store: SnapshotStore):
         self.store = store
 
     def upsert_symbol(self, symbol_id: str, model: str, vector: list[float]):
         self.store.upsert_symbol_embedding(symbol_id, model, vector)
 
-    def bulk_upsert_symbols(self, symbol_ids: list[str], model: str, vectors: list[list[float]]):
+    def bulk_upsert_symbols(
+        self,
+        symbol_ids: list[str],
+        model: str,
+        vectors: list[list[float]],
+        *,
+        commit: bool = True,
+    ):
         rows = [(sym_id, model, vec) for sym_id, vec in zip(symbol_ids, vectors)]
-        self.store.bulk_upsert_symbol_embeddings(rows)
+        self.store.bulk_upsert_symbol_embeddings(rows, commit=commit)
 
     def search(self, query_vector: list[float], top_k: int = 10, query_text: str = "") -> list[dict]:
         """
-        Hybrid search: cosine similarity (0.7) + FTS5 BM25 keyword (0.3).
+        Hybrid search: cosine similarity (0.7) + in-memory keyword score (0.3).
         Groups by file and returns top-k files with their best-matching symbols.
 
         Returns list of {"file": path, "score": float, "matched_symbols": [...]}
@@ -53,10 +60,10 @@ class VectorStore:
 
         max_cosine = max(cosine_by_sym.values()) or 1.0
 
-        # ── FTS scores ───────────────────────────────────────────────────────
+        # ── Keyword scores ───────────────────────────────────────────────────
         fts_by_sym: dict[str, float] = {}
         if query_text:
-            raw_fts = self.store.fts_search(query_text)
+            raw_fts = self.store.keyword_search(query_text)
             if raw_fts:
                 max_fts = max(score for _, score in raw_fts) or 1.0
                 for sym_id, raw_score in raw_fts:

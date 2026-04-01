@@ -1,5 +1,5 @@
 """
-High-level orchestrator for building and querying the deep (SQLite) index.
+High-level orchestrator for building and querying the deep snapshot-backed index.
 Used directly by server.py.
 """
 
@@ -8,9 +8,15 @@ import os
 from typing import Optional
 
 from .index_builder import IndexBuilder
-from .sqlite_store import SQLiteStore
+from .snapshot_store import SnapshotStore
 
 log = logging.getLogger(__name__)
+
+
+def _mtime_changed(stored: Optional[float], current: float) -> bool:
+    if stored is None:
+        return True
+    return round(float(stored), 6) != round(float(current), 6)
 
 
 class DeepIndex:
@@ -18,11 +24,11 @@ class DeepIndex:
         """
         Args:
             project_path: Root directory of the project to index.
-            db_path: Path to the SQLite database file.
+            db_path: Path to the deep-index snapshot file.
             factory: StrategyFactory instance.
         """
         self.project_path = os.path.abspath(project_path)
-        self.store = SQLiteStore(db_path)
+        self.store = SnapshotStore(db_path)
         self.builder = IndexBuilder(self.project_path, self.store, factory)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -49,10 +55,7 @@ class DeepIndex:
         for fp, current_mtime in all_entries:
             existing_on_disk.add(fp)
             stored_mtime = stored_mtimes.get(fp)
-            if stored_mtime is None:
-                changed.append(fp)
-                continue
-            if current_mtime != stored_mtime:
+            if _mtime_changed(stored_mtime, current_mtime):
                 changed.append(fp)
 
         # Also remove DB entries for files that no longer exist on disk
@@ -78,8 +81,6 @@ class DeepIndex:
         Keys: path, language, line_count, imports, exports,
               symbols (list of {type, name, line, end_line, signature, parent})
         """
-        import json
-
         path = os.path.abspath(path)
         row = self.store.get_file(path)
         if row is None:
@@ -98,23 +99,12 @@ class DeepIndex:
             for s in raw_symbols
         ]
 
-        imports: list[str] = []
-        exports: list[str] = []
-        try:
-            imports = json.loads(row["imports"] or "[]")
-        except (TypeError, ValueError):
-            pass
-        try:
-            exports = json.loads(row["exports"] or "[]")
-        except (TypeError, ValueError):
-            pass
-
         return {
             "path": row["path"],
             "language": row["language"],
             "line_count": row["line_count"],
-            "imports": imports,
-            "exports": exports,
+            "imports": list(row.get("imports") or []),
+            "exports": list(row.get("exports") or []),
             "symbols": symbols,
         }
 
@@ -214,10 +204,7 @@ class DeepIndex:
 
     def _file_path_for_symbol(self, symbol_row: dict) -> str:
         """Resolve the file path that owns a symbol row (via file_id)."""
-        conn = self.store._conn()
-        row = conn.execute(
-            "SELECT path FROM files WHERE id=?", (symbol_row["file_id"],)
-        ).fetchone()
+        row = self.store.get_file_by_id(symbol_row["file_id"])
         return row["path"] if row else ""
 
     # ── Status ────────────────────────────────────────────────────────────────
@@ -228,11 +215,9 @@ class DeepIndex:
 
     def get_stats(self) -> dict:
         """Return {files, symbols, embeddings, built_at, project_path}."""
-        conn = self.store._conn()
-        symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
         return {
             "files": self.store.get_file_count(),
-            "symbols": symbol_count,
+            "symbols": self.store.get_symbol_count(),
             "embeddings": self.store.get_symbol_embedding_count(),
             "built_at": self.store.get_meta("built_at"),
             "project_path": self.store.get_meta("project_path"),
@@ -245,6 +230,6 @@ class DeepIndex:
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property
-    def store_ref(self) -> SQLiteStore:
+    def store_ref(self) -> SnapshotStore:
         """Expose store for embedding writes from server.py."""
         return self.store

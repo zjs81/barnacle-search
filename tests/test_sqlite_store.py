@@ -1,19 +1,15 @@
-"""Tests for SQLiteStore — schema, CRUD, FTS, and embedding operations."""
-
-import tempfile
-import time
-from pathlib import Path
+"""Tests for SnapshotStore — snapshot persistence, CRUD, search, and embeddings."""
 
 import pytest
 
-from code_indexer.indexing.sqlite_store import SQLiteStore
+from code_indexer.indexing.snapshot_store import SnapshotStore
 from code_indexer.models.file_info import FileInfo
 from code_indexer.models.symbol_info import SymbolInfo
 
 
 @pytest.fixture
 def store(tmp_path):
-    return SQLiteStore(str(tmp_path / "test.db"))
+    return SnapshotStore(str(tmp_path / "test.bin"))
 
 
 @pytest.fixture
@@ -181,16 +177,16 @@ class TestSymbolEmbeddings:
         assert "foo.py::Foo.parse" in ids
 
 
-# ── FTS Search ───────────────────────────────────────────────────────────────
+# ── Keyword Search ───────────────────────────────────────────────────────────
 
-class TestFTSSearch:
-    def test_fts_finds_by_name(self, store, sample_file):
+class TestKeywordSearch:
+    def test_keyword_search_finds_by_name(self, store, sample_file):
         store.insert_symbols(sample_file, [make_symbol("AuthenticateUser")])
-        results = store.fts_search("AuthenticateUser")
+        results = store.keyword_search("AuthenticateUser")
         sym_ids = [r[0] for r in results]
         assert "foo.py::Foo.AuthenticateUser" in sym_ids
 
-    def test_fts_finds_by_signature(self, store, sample_file):
+    def test_keyword_search_finds_by_signature(self, store, sample_file):
         sym = SymbolInfo(
             type="method",
             name="Hash",
@@ -202,48 +198,65 @@ class TestFTSSearch:
             parent="Hasher",
         )
         store.insert_symbols(sample_file, [sym])
-        results = store.fts_search("PasswordHasher")
+        results = store.keyword_search("PasswordHasher")
         assert len(results) > 0
 
-    def test_fts_finds_by_body_text(self, store, sample_file):
+    def test_keyword_search_finds_by_body_text(self, store, sample_file):
         sym = make_symbol("RouteMeshMessage")
         sym.body_text = "mesh network node connection handling retries"
         store.insert_symbols(sample_file, [sym])
-        results = store.fts_search("connection handling")
+        results = store.keyword_search("connection handling")
         sym_ids = [r[0] for r in results]
         assert "foo.py::Foo.RouteMeshMessage" in sym_ids
 
-    def test_fts_multiword_query_uses_or_matching(self, store, sample_file):
+    def test_keyword_search_uses_or_matching(self, store, sample_file):
         sym = make_symbol("ConnectMeshNode")
         sym.body_text = "mesh node transport retry logic"
         store.insert_symbols(sample_file, [sym])
-        results = store.fts_search("mesh network connection handling")
+        results = store.keyword_search("mesh network connection handling")
         sym_ids = [r[0] for r in results]
         assert "foo.py::Foo.ConnectMeshNode" in sym_ids
 
-    def test_fts_returns_empty_for_no_match(self, store, sample_file):
+    def test_keyword_search_returns_empty_for_no_match(self, store, sample_file):
         store.insert_symbols(sample_file, [make_symbol("parse")])
-        results = store.fts_search("xyzzy_nonexistent_token_12345")
+        results = store.keyword_search("xyzzy_nonexistent_token_12345")
         assert results == []
 
-    def test_fts_scores_are_positive(self, store, sample_file):
+    def test_keyword_search_scores_are_positive(self, store, sample_file):
         store.insert_symbols(sample_file, [make_symbol("Process"), make_symbol("ProcessAsync")])
-        results = store.fts_search("Process")
+        results = store.keyword_search("Process")
         for _sym_id, score in results:
             assert score > 0
 
-    def test_fts_deleted_file_cleans_fts(self, store, sample_file):
+    def test_keyword_search_deleted_file_cleans_index(self, store, sample_file):
         store.insert_symbols(sample_file, [make_symbol("AuthenticateUser")])
         store.delete_file("/project/foo.py")
-        results = store.fts_search("AuthenticateUser")
+        results = store.keyword_search("AuthenticateUser")
         assert results == []
 
-    def test_fts_safe_query_sanitization(self, store, sample_file):
-        # Queries with FTS5 operator chars should not raise
+    def test_keyword_search_safe_query_sanitization(self, store, sample_file):
         store.insert_symbols(sample_file, [make_symbol("parse")])
-        assert store.fts_search("-bad") == []
-        assert store.fts_search("+bad") == []
-        assert store.fts_search("") == []
+        assert store.keyword_search("-bad") == []
+        assert store.keyword_search("+bad") == []
+        assert store.keyword_search("") == []
+
+
+class TestSnapshotPersistence:
+    def test_persists_across_instances(self, tmp_path):
+        path = tmp_path / "test.bin"
+        store = SnapshotStore(str(path))
+        file_id = store.upsert_file(
+            FileInfo(path="/project/foo.py", language="python", line_count=10, mtime=1.0)
+        )
+        store.insert_symbols(file_id, [make_symbol("parse")])
+        store.upsert_symbol_embedding("foo.py::Foo.parse", "m", [1.0, 2.0])
+        store.set_meta("built_at", "123")
+
+        reloaded = SnapshotStore(str(path))
+        assert reloaded.get_meta("built_at") == "123"
+        assert reloaded.get_file("/project/foo.py") is not None
+        assert reloaded.get_symbol_by_id("foo.py::Foo.parse") is not None
+        assert reloaded.get_symbol_embedding_count() == 1
 
 
 # ── Metadata ─────────────────────────────────────────────────────────────────

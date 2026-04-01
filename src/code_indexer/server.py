@@ -12,14 +12,12 @@ import collections
 import hashlib
 import logging
 import os
-import tempfile
-from contextlib import asynccontextmanager
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from .constants import (
-    DEEP_INDEX_DB_FILE,
+    DEEP_INDEX_SNAPSHOT_FILE,
     EMBED_BATCH_SIZE,
     EMBED_MODEL,
     OLLAMA_BASE_URL,
@@ -29,6 +27,7 @@ from .constants import (
 from .embeddings.ollama_client import OllamaClient, ModelNotFoundError
 from .embeddings.vector_store import VectorStore
 from .indexing.deep_index import DeepIndex
+from .indexing.deep_index import _mtime_changed
 from .indexing.shallow_index import ShallowIndex
 from .indexing.strategies.factory import StrategyFactory
 from .search.grep_search import search_code as _grep_search_code
@@ -103,7 +102,7 @@ async def _sync_stale_files():
                 logger.info("Removing deleted file from index: %s", path)
                 state["deep"].store_ref.delete_file(path)
                 continue
-            if stored_mtime is None or current_mtime > stored_mtime:
+            if _mtime_changed(stored_mtime, current_mtime):
                 logger.info("Re-parsing stale file: %s", path)
                 state["deep"].rebuild_file(path)
 
@@ -226,14 +225,14 @@ async def set_project_path(path: str) -> str:
 
     cache_dir = _cache_dir_for(abs_path)
     shallow_path = os.path.join(cache_dir, SHALLOW_INDEX_FILE)
-    db_path = os.path.join(cache_dir, DEEP_INDEX_DB_FILE)
+    db_path = os.path.join(cache_dir, DEEP_INDEX_SNAPSHOT_FILE)
 
     # Build shallow index
     shallow = ShallowIndex()
     shallow.build(abs_path)
     shallow.save(shallow_path)
 
-    # Initialize deep index (creates schema if needed)
+    # Initialize deep index snapshot and in-memory lookup state
     deep = DeepIndex(abs_path, db_path, _factory)
     vector = VectorStore(deep.store_ref)
 
@@ -335,32 +334,17 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
 
                 # Symbol-level embeddings: find symbols without embeddings yet
                 if force_rebuild:
-                    deep.store_ref._conn().execute("DELETE FROM symbol_embeddings")
-                    deep.store_ref._conn().commit()
-                    symbols_needing_embed = deep.store_ref._conn().execute(
-                        """
-                        SELECT s.symbol_id, s.short_name, s.parent, s.type, s.signature,
-                               s.line, s.end_line, f.path, f.language
-                        FROM symbols s
-                        JOIN files f ON f.id = s.file_id
-                        """
-                    ).fetchall()
-                    symbols_needing_embed = [dict(r) for r in symbols_needing_embed]
+                    deep.store_ref.clear_symbol_embeddings()
+                    symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
                 else:
                     symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
 
-                symbol_rows = deep.store_ref._conn().execute(
-                    "SELECT type, COUNT(*) AS cnt FROM symbols GROUP BY type"
-                ).fetchall()
-                symbol_counts = collections.Counter(
-                    {row["type"] or "unknown": row["cnt"] for row in symbol_rows}
-                )
+                symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
                 logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
 
                 # Build (symbol_id, embed_text) pairs, skipping low-value symbols.
                 # Cache file lines per path to avoid re-reading the same file for each symbol.
                 pending: list[tuple[str, str]] = []
-                file_lines_cache: dict[str, list[str]] = {}
                 pending_by_type: collections.Counter[str] = collections.Counter()
                 skipped_by_reason: collections.Counter[str] = collections.Counter()
                 for sym in symbols_needing_embed:
@@ -369,13 +353,7 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
                         skipped_by_reason[skip_reason] += 1
                         continue
                     fp = sym["path"]
-                    if fp not in file_lines_cache:
-                        try:
-                            with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
-                                file_lines_cache[fp] = fh.readlines()
-                        except OSError:
-                            file_lines_cache[fp] = []
-                    text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
+                    text = builder.build_symbol_embed_text(sym, fp)
                     pending.append((sym["symbol_id"], text))
                     pending_by_type[sym.get("type", "unknown")] += 1
 
@@ -397,8 +375,10 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
                             "embeddings": embed_count,
                         }
                     if vectors:
-                        vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+                        vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
                         embed_count += len(vectors)
+                if embed_count > 0:
+                    deep.store_ref.commit()
 
             return {
                 "files_parsed": build_stats.get("files", 0),
