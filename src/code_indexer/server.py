@@ -242,7 +242,7 @@ async def _sync_stale_files():
         state = _state
         if state["deep"] is None:
             return
-        state["deep"].sync_stale_files()
+        await asyncio.to_thread(state["deep"].sync_stale_files)
 
     await _embed_pending()
 
@@ -254,52 +254,60 @@ async def _embed_pending():
             state = _state
             if state["deep"] is None or state["vector"] is None:
                 return
-            with state["deep"].mutation_lock():
-                ollama_ok = await _ollama.is_available()
-                if not ollama_ok:
-                    return
 
-                symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
-                if not symbols_needing_embed:
-                    return
-
-                builder = state["deep"].builder
-                pending: list[tuple[str, str]] = []
-                file_lines_cache: dict[str, list[str]] = {}
-                pending_by_type: collections.Counter[str] = collections.Counter()
-                skipped_by_reason: collections.Counter[str] = collections.Counter()
-                for sym in symbols_needing_embed:
-                    skip_reason = _skip_embedding_reason(sym)
-                    if skip_reason:
-                        skipped_by_reason[skip_reason] += 1
-                        continue
-                    fp = sym["path"]
-                    if fp not in file_lines_cache:
-                        try:
-                            with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
-                                file_lines_cache[fp] = fh.readlines()
-                        except OSError:
-                            file_lines_cache[fp] = []
-                    text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
-                    pending.append((sym["symbol_id"], text))
-                    pending_by_type[sym.get("type", "unknown")] += 1
-
-                logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
-                if skipped_by_reason:
-                    logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
-
-                for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                    batch = pending[i : i + EMBED_BATCH_SIZE]
-                    symbol_ids = [p[0] for p in batch]
-                    texts = [p[1] for p in batch]
-                    try:
-                        vectors = await _ollama.embed_batch(texts)
-                    except ModelNotFoundError:
-                        return
-                    if vectors:
-                        state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
-                logger.info("Auto-embedded %d new symbols", len(pending))
+            ollama_ok = await _ollama.is_available()
+            if not ollama_ok:
                 return
+
+            # Collect pending symbols in a thread to avoid blocking the event loop
+            def _collect():
+                with state["deep"].mutation_lock():
+                    symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
+                    if not symbols_needing_embed:
+                        return None
+
+                    builder = state["deep"].builder
+                    pending: list[tuple[str, str]] = []
+                    file_lines_cache: dict[str, list[str]] = {}
+                    pending_by_type: collections.Counter[str] = collections.Counter()
+                    skipped_by_reason: collections.Counter[str] = collections.Counter()
+                    for sym in symbols_needing_embed:
+                        skip_reason = _skip_embedding_reason(sym)
+                        if skip_reason:
+                            skipped_by_reason[skip_reason] += 1
+                            continue
+                        fp = sym["path"]
+                        if fp not in file_lines_cache:
+                            try:
+                                with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+                                    file_lines_cache[fp] = fh.readlines()
+                            except OSError:
+                                file_lines_cache[fp] = []
+                        text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
+                        pending.append((sym["symbol_id"], text))
+                        pending_by_type[sym.get("type", "unknown")] += 1
+
+                    logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
+                    if skipped_by_reason:
+                        logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
+                    return pending
+
+            pending = await asyncio.to_thread(_collect)
+            if pending is None:
+                return
+
+            for i in range(0, len(pending), EMBED_BATCH_SIZE):
+                batch = pending[i : i + EMBED_BATCH_SIZE]
+                symbol_ids = [p[0] for p in batch]
+                texts = [p[1] for p in batch]
+                try:
+                    vectors = await _ollama.embed_batch(texts)
+                except ModelNotFoundError:
+                    return
+                if vectors:
+                    state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+            logger.info("Auto-embedded %d new symbols", len(pending))
+            return
 
 
 async def _run_deep_index_build(
@@ -318,97 +326,108 @@ async def _run_deep_index_build(
             # Stop file watcher during build to prevent concurrent DB writes
             _watcher.stop()
             try:
-                with deep.mutation_lock():
-                    build_stats = deep.build_locked(
-                        force_rebuild=force_rebuild,
-                        progress_callback=lambda completed, total: _set_build_progress(
-                            "parsing",
-                            completed,
-                            total,
-                            message="Parsing files for the deep index.",
-                        ),
-                    )
-
-                    embed_count = 0
-                    embed_skipped = False
-
-                    ollama_ok = await _ollama.is_available()
-                    if not ollama_ok:
-                        logger.warning(
-                            "Ollama not reachable at %s — skipping embeddings. "
-                            "Run `ollama serve` and pull %s to enable semantic search.",
-                            OLLAMA_BASE_URL,
-                            EMBED_MODEL,
+                # Phase 1: Parse files in a thread to avoid blocking the event loop
+                def _parse_phase():
+                    with deep.mutation_lock():
+                        return deep.build_locked(
+                            force_rebuild=force_rebuild,
+                            progress_callback=lambda completed, total: _set_build_progress(
+                                "parsing",
+                                completed,
+                                total,
+                                message="Parsing files for the deep index.",
+                            ),
                         )
-                        embed_skipped = True
-                    else:
-                        builder = deep.builder
 
-                        if force_rebuild:
-                            deep.store_ref.clear_symbol_embeddings()
-                            symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
-                        else:
-                            symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
+                build_stats = await asyncio.to_thread(_parse_phase)
 
-                        symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
-                        logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
+                embed_count = 0
+                embed_skipped = False
 
-                        pending: list[tuple[str, str]] = []
-                        pending_by_type: collections.Counter[str] = collections.Counter()
-                        skipped_by_reason: collections.Counter[str] = collections.Counter()
-                        for sym in symbols_needing_embed:
-                            skip_reason = _skip_embedding_reason(sym)
-                            if skip_reason:
-                                skipped_by_reason[skip_reason] += 1
-                                continue
-                            fp = sym["path"]
-                            text = builder.build_symbol_embed_text(sym, fp)
-                            pending.append((sym["symbol_id"], text))
-                            pending_by_type[sym.get("type", "unknown")] += 1
+                ollama_ok = await _ollama.is_available()
+                if not ollama_ok:
+                    logger.warning(
+                        "Ollama not reachable at %s — skipping embeddings. "
+                        "Run `ollama serve` and pull %s to enable semantic search.",
+                        OLLAMA_BASE_URL,
+                        EMBED_MODEL,
+                    )
+                    embed_skipped = True
+                else:
+                    # Phase 2: Collect pending symbols in a thread
+                    def _collect_pending():
+                        with deep.mutation_lock():
+                            builder = deep.builder
 
-                        logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
-                        if skipped_by_reason:
-                            logger.info(
-                                "Skipped embedding by reason: %s",
-                                _format_counter(skipped_by_reason),
+                            if force_rebuild:
+                                deep.store_ref.clear_symbol_embeddings()
+                                symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
+                            else:
+                                symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
+
+                            symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
+                            logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
+
+                            pending: list[tuple[str, str]] = []
+                            pending_by_type: collections.Counter[str] = collections.Counter()
+                            skipped_by_reason: collections.Counter[str] = collections.Counter()
+                            for sym in symbols_needing_embed:
+                                skip_reason = _skip_embedding_reason(sym)
+                                if skip_reason:
+                                    skipped_by_reason[skip_reason] += 1
+                                    continue
+                                fp = sym["path"]
+                                text = builder.build_symbol_embed_text(sym, fp)
+                                pending.append((sym["symbol_id"], text))
+                                pending_by_type[sym.get("type", "unknown")] += 1
+
+                            logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
+                            if skipped_by_reason:
+                                logger.info(
+                                    "Skipped embedding by reason: %s",
+                                    _format_counter(skipped_by_reason),
+                                )
+                            return pending
+
+                    pending = await asyncio.to_thread(_collect_pending)
+
+                    # Phase 3: Embed batches (async, on event loop)
+                    _set_build_progress(
+                        "embedding",
+                        0,
+                        len(pending),
+                        message="Generating embeddings for semantic search.",
+                    )
+                    for i in range(0, len(pending), EMBED_BATCH_SIZE):
+                        batch = pending[i : i + EMBED_BATCH_SIZE]
+                        symbol_ids = [p[0] for p in batch]
+                        texts = [p[1] for p in batch]
+                        try:
+                            vectors = await _ollama.embed_batch(texts)
+                        except ModelNotFoundError as exc:
+                            _build_state["status"] = "failed"
+                            _build_state["error"] = str(exc)
+                            _build_state["finished_at"] = time.time()
+                            _build_state["message"] = (
+                                "Deep index build failed. Call get_index_status() for details."
                             )
-
+                            _build_state["result"] = {
+                                "files_parsed": build_stats.get("files", 0),
+                                "symbols": build_stats.get("symbols", 0),
+                                "embeddings": embed_count,
+                            }
+                            return
+                        if vectors:
+                            vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
+                            embed_count += len(vectors)
                         _set_build_progress(
                             "embedding",
-                            0,
+                            min(i + len(batch), len(pending)),
                             len(pending),
                             message="Generating embeddings for semantic search.",
                         )
-                        for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                            batch = pending[i : i + EMBED_BATCH_SIZE]
-                            symbol_ids = [p[0] for p in batch]
-                            texts = [p[1] for p in batch]
-                            try:
-                                vectors = await _ollama.embed_batch(texts)
-                            except ModelNotFoundError as exc:
-                                _build_state["status"] = "failed"
-                                _build_state["error"] = str(exc)
-                                _build_state["finished_at"] = time.time()
-                                _build_state["message"] = (
-                                    "Deep index build failed. Call get_index_status() for details."
-                                )
-                                _build_state["result"] = {
-                                    "files_parsed": build_stats.get("files", 0),
-                                    "symbols": build_stats.get("symbols", 0),
-                                    "embeddings": embed_count,
-                                }
-                                return
-                            if vectors:
-                                vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
-                                embed_count += len(vectors)
-                            _set_build_progress(
-                                "embedding",
-                                min(i + len(batch), len(pending)),
-                                len(pending),
-                                message="Generating embeddings for semantic search.",
-                            )
-                        if embed_count > 0:
-                            deep.store_ref.commit()
+                    if embed_count > 0:
+                        deep.store_ref.commit()
 
                 _build_state["status"] = "completed"
                 _build_state["finished_at"] = time.time()
