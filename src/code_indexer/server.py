@@ -12,6 +12,7 @@ import collections
 import hashlib
 import logging
 import os
+import time
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -51,6 +52,23 @@ _state: dict = {
     "deep": None,      # DeepIndex
     "vector": None,    # VectorStore
 }
+_build_state: dict = {
+    "task": None,
+    "status": "idle",
+    "project_path": None,
+    "force_rebuild": False,
+    "started_at": None,
+    "finished_at": None,
+    "phase": None,
+    "phase_started_at": None,
+    "completed": 0,
+    "total": 0,
+    "percent_done": 0.0,
+    "eta_seconds": None,
+    "message": None,
+    "result": None,
+    "error": None,
+}
 
 
 def _cache_dir_for(project_path: str) -> str:
@@ -65,6 +83,130 @@ def _require_project() -> dict:
     if _state["project_path"] is None:
         raise ValueError("No project set. Call set_project_path first.")
     return _state
+
+
+def _reset_build_state(project_path: Optional[str] = None) -> None:
+    _build_state.update(
+        {
+            "task": None,
+            "status": "idle",
+            "project_path": project_path,
+            "force_rebuild": False,
+            "started_at": None,
+            "finished_at": None,
+            "phase": None,
+            "phase_started_at": None,
+            "completed": 0,
+            "total": 0,
+            "percent_done": 0.0,
+            "eta_seconds": None,
+            "message": None,
+            "result": None,
+            "error": None,
+        }
+    )
+
+
+def _recompute_eta() -> None:
+    phase_started_at = _build_state["phase_started_at"]
+    completed = _build_state["completed"]
+    total = _build_state["total"]
+    if not phase_started_at or total <= 0 or completed <= 0 or completed >= total:
+        _build_state["eta_seconds"] = 0 if total > 0 and completed >= total else None
+        return
+
+    elapsed = max(time.time() - phase_started_at, 0.001)
+    rate = completed / elapsed
+    if rate <= 0:
+        _build_state["eta_seconds"] = None
+        return
+    _build_state["eta_seconds"] = max(int(round((total - completed) / rate)), 0)
+
+
+def _set_build_progress(phase: str, completed: int, total: int, *, message: Optional[str] = None) -> None:
+    if _build_state["phase"] != phase:
+        _build_state["phase"] = phase
+        _build_state["phase_started_at"] = time.time()
+
+    _build_state["completed"] = max(completed, 0)
+    _build_state["total"] = max(total, 0)
+    _build_state["percent_done"] = (
+        round((_build_state["completed"] / _build_state["total"]) * 100, 1)
+        if _build_state["total"] > 0
+        else 100.0
+    )
+    if message is not None:
+        _build_state["message"] = message
+    _recompute_eta()
+
+
+def _get_indexing_status() -> dict:
+    task = _build_state["task"]
+    in_progress = bool(task and not task.done())
+    return {
+        "status": _build_state["status"],
+        "in_progress": in_progress,
+        "project_path": _build_state["project_path"],
+        "force_rebuild": _build_state["force_rebuild"],
+        "started_at": _build_state["started_at"],
+        "finished_at": _build_state["finished_at"],
+        "phase": _build_state["phase"],
+        "completed": _build_state["completed"],
+        "total": _build_state["total"],
+        "percent_done": _build_state["percent_done"],
+        "eta_seconds": _build_state["eta_seconds"],
+        "message": _build_state["message"],
+        "result": _build_state["result"],
+        "error": _build_state["error"],
+    }
+
+
+def _start_build_job(force_rebuild: bool) -> dict:
+    state = _require_project()
+    task = _build_state["task"]
+    if task and not task.done():
+        _build_state["message"] = (
+            "Deep index build already in progress. Call get_index_status() to track progress."
+        )
+        return {
+            "status": "already_in_progress",
+            "message": _build_state["message"],
+            "indexing": _get_indexing_status(),
+        }
+
+    _build_state.update(
+        {
+            "task": None,
+            "status": "queued",
+            "project_path": state["project_path"],
+            "force_rebuild": force_rebuild,
+            "started_at": time.time(),
+            "finished_at": None,
+            "phase": "queued",
+            "phase_started_at": time.time(),
+            "completed": 0,
+            "total": 0,
+            "percent_done": 0.0,
+            "eta_seconds": None,
+            "message": "Deep index build queued. Call get_index_status() to track progress.",
+            "result": None,
+            "error": None,
+        }
+    )
+    task = asyncio.create_task(
+        _run_deep_index_build(
+            project_path=state["project_path"],
+            deep=state["deep"],
+            vector=state["vector"],
+            force_rebuild=force_rebuild,
+        )
+    )
+    _build_state["task"] = task
+    return {
+        "status": "started",
+        "message": "Deep index build started. Call get_index_status() to track progress.",
+        "indexing": _get_indexing_status(),
+    }
 
 
 def _rebuild_callback(file_path: str):
@@ -160,6 +302,150 @@ async def _embed_pending():
                 return
 
 
+async def _run_deep_index_build(
+    *,
+    project_path: str,
+    deep: DeepIndex,
+    vector: VectorStore,
+    force_rebuild: bool,
+) -> None:
+    build_stats: dict = {"files": 0, "symbols": 0, "errors": 0}
+    try:
+        async with _index_lock:
+            _build_state["status"] = "running"
+            _build_state["message"] = "Parsing files for the deep index."
+
+            # Stop file watcher during build to prevent concurrent DB writes
+            _watcher.stop()
+            try:
+                with deep.mutation_lock():
+                    build_stats = deep.build_locked(
+                        force_rebuild=force_rebuild,
+                        progress_callback=lambda completed, total: _set_build_progress(
+                            "parsing",
+                            completed,
+                            total,
+                            message="Parsing files for the deep index.",
+                        ),
+                    )
+
+                    embed_count = 0
+                    embed_skipped = False
+
+                    ollama_ok = await _ollama.is_available()
+                    if not ollama_ok:
+                        logger.warning(
+                            "Ollama not reachable at %s — skipping embeddings. "
+                            "Run `ollama serve` and pull %s to enable semantic search.",
+                            OLLAMA_BASE_URL,
+                            EMBED_MODEL,
+                        )
+                        embed_skipped = True
+                    else:
+                        builder = deep.builder
+
+                        if force_rebuild:
+                            deep.store_ref.clear_symbol_embeddings()
+                            symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
+                        else:
+                            symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
+
+                        symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
+                        logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
+
+                        pending: list[tuple[str, str]] = []
+                        pending_by_type: collections.Counter[str] = collections.Counter()
+                        skipped_by_reason: collections.Counter[str] = collections.Counter()
+                        for sym in symbols_needing_embed:
+                            skip_reason = _skip_embedding_reason(sym)
+                            if skip_reason:
+                                skipped_by_reason[skip_reason] += 1
+                                continue
+                            fp = sym["path"]
+                            text = builder.build_symbol_embed_text(sym, fp)
+                            pending.append((sym["symbol_id"], text))
+                            pending_by_type[sym.get("type", "unknown")] += 1
+
+                        logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
+                        if skipped_by_reason:
+                            logger.info(
+                                "Skipped embedding by reason: %s",
+                                _format_counter(skipped_by_reason),
+                            )
+
+                        _set_build_progress(
+                            "embedding",
+                            0,
+                            len(pending),
+                            message="Generating embeddings for semantic search.",
+                        )
+                        for i in range(0, len(pending), EMBED_BATCH_SIZE):
+                            batch = pending[i : i + EMBED_BATCH_SIZE]
+                            symbol_ids = [p[0] for p in batch]
+                            texts = [p[1] for p in batch]
+                            try:
+                                vectors = await _ollama.embed_batch(texts)
+                            except ModelNotFoundError as exc:
+                                _build_state["status"] = "failed"
+                                _build_state["error"] = str(exc)
+                                _build_state["finished_at"] = time.time()
+                                _build_state["message"] = (
+                                    "Deep index build failed. Call get_index_status() for details."
+                                )
+                                _build_state["result"] = {
+                                    "files_parsed": build_stats.get("files", 0),
+                                    "symbols": build_stats.get("symbols", 0),
+                                    "embeddings": embed_count,
+                                }
+                                return
+                            if vectors:
+                                vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
+                                embed_count += len(vectors)
+                            _set_build_progress(
+                                "embedding",
+                                min(i + len(batch), len(pending)),
+                                len(pending),
+                                message="Generating embeddings for semantic search.",
+                            )
+                        if embed_count > 0:
+                            deep.store_ref.commit()
+
+                _build_state["status"] = "completed"
+                _build_state["finished_at"] = time.time()
+                _build_state["message"] = "Deep index build completed."
+                _build_state["result"] = {
+                    "files_parsed": build_stats.get("files", 0),
+                    "symbols": build_stats.get("symbols", 0),
+                    "errors": build_stats.get("errors", 0),
+                    "embeddings": embed_count,
+                    "embeddings_skipped": embed_skipped,
+                    "model": EMBED_MODEL if not embed_skipped else None,
+                }
+                if _build_state["phase"] != "embedding":
+                    _set_build_progress(
+                        "parsing",
+                        _build_state["total"],
+                        _build_state["total"],
+                        message="Deep index build completed.",
+                    )
+                else:
+                    _set_build_progress(
+                        "embedding",
+                        _build_state["total"],
+                        _build_state["total"],
+                        message="Deep index build completed.",
+                    )
+            finally:
+                if _state["project_path"] == project_path and _state["deep"] is deep:
+                    _watcher.start(project_path, _rebuild_callback, _repo_change_callback)
+    except Exception as exc:
+        _build_state["status"] = "failed"
+        _build_state["finished_at"] = time.time()
+        _build_state["error"] = str(exc)
+        _build_state["message"] = "Deep index build failed. Call get_index_status() for details."
+        logger.exception("Deep index build failed")
+
+
 # ── Embedding filter ──────────────────────────────────────────────────────────
 
 def _skip_embedding(sym: dict) -> bool:
@@ -241,6 +527,7 @@ async def set_project_path(path: str) -> str:
     _state["shallow"] = shallow
     _state["deep"] = deep
     _state["vector"] = vector
+    _reset_build_state(project_path=abs_path)
 
     # Start watcher
     _watcher.start(abs_path, _rebuild_callback, _repo_change_callback)
@@ -284,6 +571,7 @@ def get_index_status() -> dict:
             "built": state["deep"].is_built() if state["deep"] else False,
             **deep_stats,
         },
+        "indexing": _get_indexing_status(),
         "watcher": watcher_status,
     }
 
@@ -300,93 +588,8 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
     Returns:
         Dict with files, symbols, errors, embeddings counts and model used.
     """
-    state = _require_project()
-    deep: DeepIndex = state["deep"]
-    vector: VectorStore = state["vector"]
-
-    async with _index_lock:
-        # Stop file watcher during build to prevent concurrent DB writes
-        # (watcher runs in a background thread and can race with the build)
-        _watcher.stop()
-        try:
-            with deep.mutation_lock():
-                # Phase 1: parse all files
-                build_stats = deep.build_locked(force_rebuild=force_rebuild)
-
-                # Phase 2: generate embeddings via Ollama
-                embed_count = 0
-                embed_skipped = False
-
-                ollama_ok = await _ollama.is_available()
-                if not ollama_ok:
-                    logger.warning(
-                        "Ollama not reachable at %s — skipping embeddings. "
-                        "Run `ollama serve` and pull %s to enable semantic search.",
-                        OLLAMA_BASE_URL,
-                        EMBED_MODEL,
-                    )
-                    embed_skipped = True
-                else:
-                    builder = deep.builder
-
-                    # Symbol-level embeddings: find symbols without embeddings yet
-                    if force_rebuild:
-                        deep.store_ref.clear_symbol_embeddings()
-                        symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
-                    else:
-                        symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
-
-                    symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
-                    logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
-
-                    # Build (symbol_id, embed_text) pairs, skipping low-value symbols.
-                    # Cache file lines per path to avoid re-reading the same file for each symbol.
-                    pending: list[tuple[str, str]] = []
-                    pending_by_type: collections.Counter[str] = collections.Counter()
-                    skipped_by_reason: collections.Counter[str] = collections.Counter()
-                    for sym in symbols_needing_embed:
-                        skip_reason = _skip_embedding_reason(sym)
-                        if skip_reason:
-                            skipped_by_reason[skip_reason] += 1
-                            continue
-                        fp = sym["path"]
-                        text = builder.build_symbol_embed_text(sym, fp)
-                        pending.append((sym["symbol_id"], text))
-                        pending_by_type[sym.get("type", "unknown")] += 1
-
-                    logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
-                    if skipped_by_reason:
-                        logger.info("Skipped embedding by reason: %s", _format_counter(skipped_by_reason))
-
-                    for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                        batch = pending[i : i + EMBED_BATCH_SIZE]
-                        symbol_ids = [p[0] for p in batch]
-                        texts = [p[1] for p in batch]
-                        try:
-                            vectors = await _ollama.embed_batch(texts)
-                        except ModelNotFoundError as exc:
-                            return {
-                                "error": str(exc),
-                                "files_parsed": build_stats.get("files", 0),
-                                "symbols": build_stats.get("symbols", 0),
-                                "embeddings": embed_count,
-                            }
-                        if vectors:
-                            vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
-                            embed_count += len(vectors)
-                    if embed_count > 0:
-                        deep.store_ref.commit()
-
-            return {
-                "files_parsed": build_stats.get("files", 0),
-                "symbols": build_stats.get("symbols", 0),
-                "errors": build_stats.get("errors", 0),
-                "embeddings": embed_count,
-                "embeddings_skipped": embed_skipped,
-                "model": EMBED_MODEL if not embed_skipped else None,
-            }
-        finally:
-            _watcher.start(state["project_path"], _rebuild_callback, _repo_change_callback)
+    _require_project()
+    return _start_build_job(force_rebuild=force_rebuild)
 
 
 @mcp.tool()

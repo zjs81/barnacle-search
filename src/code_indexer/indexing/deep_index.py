@@ -40,11 +40,14 @@ class DeepIndex:
             self.store.refresh_from_disk()
             yield
 
-    def build(self, force_rebuild: bool = False) -> dict:
+    def build(self, force_rebuild: bool = False, progress_callback=None) -> dict:
         with self.mutation_lock():
-            return self.build_locked(force_rebuild=force_rebuild)
+            return self.build_locked(
+                force_rebuild=force_rebuild,
+                progress_callback=progress_callback,
+            )
 
-    def build_locked(self, force_rebuild: bool = False) -> dict:
+    def build_locked(self, force_rebuild: bool = False, progress_callback=None) -> dict:
         """
         Build (or rebuild) the deep index.
 
@@ -56,7 +59,7 @@ class DeepIndex:
         if force_rebuild:
             # Wipe existing file records; CASCADE removes symbols + embeddings
             self.store.clear_files()
-            return self.builder.build_all()
+            return self.builder.build_all(progress_callback=progress_callback)
 
         # Incremental: collect candidate files, skip unchanged ones
         all_entries = self.builder._collect_file_entries()
@@ -77,9 +80,15 @@ class DeepIndex:
                 removed = True
 
         if not changed:
+            if progress_callback is not None:
+                progress_callback(0, 0)
             self.builder._finalize_build_metadata()
             return {"files": 0, "symbols": 0, "errors": 0}
-        stats = self.builder.build_files(changed, replace_existing=True)
+        stats = self.builder.build_files(
+            changed,
+            replace_existing=True,
+            progress_callback=progress_callback,
+        )
         self.builder._finalize_build_metadata()
         return stats
 

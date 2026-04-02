@@ -38,12 +38,12 @@ class IndexBuilder:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def build_all(self) -> dict:
+    def build_all(self, progress_callback=None) -> dict:
         """
         Parse all files in project_path in parallel.
         Returns {"files": N, "symbols": M, "errors": K}
         """
-        stats = self.build_files(self._collect_files())
+        stats = self.build_files(self._collect_files(), progress_callback=progress_callback)
         self._finalize_build_metadata()
         return stats
 
@@ -125,10 +125,15 @@ class IndexBuilder:
 
         return file_info, file_info.symbols
 
-    def build_files(self, files: list[str], *, replace_existing: bool = False) -> dict:
+    def build_files(self, files: list[str], *, replace_existing: bool = False,
+                    progress_callback=None) -> dict:
         total_files = 0
         total_symbols = 0
         total_errors = 0
+        processed = 0
+
+        if progress_callback is not None:
+            progress_callback(0, len(files))
 
         with ThreadPoolExecutor(max_workers=INDEX_MAX_WORKERS) as executor:
             futures = {executor.submit(self._process_file, fp): fp for fp in files}
@@ -139,10 +144,16 @@ class IndexBuilder:
                 except Exception as exc:
                     log.warning("Unexpected error processing %s: %s", fp, exc)
                     total_errors += 1
+                    processed += 1
+                    if progress_callback is not None:
+                        progress_callback(processed, len(files))
                     continue
 
                 if result is None:
                     total_errors += 1
+                    processed += 1
+                    if progress_callback is not None:
+                        progress_callback(processed, len(files))
                     continue
 
                 file_info, symbols = result
@@ -159,10 +170,16 @@ class IndexBuilder:
                 except Exception as exc:
                     log.warning("DB write failed for %s: %s", fp, exc)
                     total_errors += 1
+                    processed += 1
+                    if progress_callback is not None:
+                        progress_callback(processed, len(files))
                     continue
 
                 total_files += 1
                 total_symbols += len(symbols)
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, len(files))
 
         return {"files": total_files, "symbols": total_symbols, "errors": total_errors}
 
