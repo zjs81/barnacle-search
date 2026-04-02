@@ -27,7 +27,6 @@ from .constants import (
 from .embeddings.ollama_client import OllamaClient, ModelNotFoundError
 from .embeddings.vector_store import VectorStore
 from .indexing.deep_index import DeepIndex
-from .indexing.deep_index import _mtime_changed
 from .indexing.shallow_index import ShallowIndex
 from .indexing.strategies.factory import StrategyFactory
 from .search.grep_search import search_code as _grep_search_code
@@ -84,27 +83,24 @@ def _rebuild_callback(file_path: str):
         pass
 
 
+def _repo_change_callback():
+    """Called by the file watcher when the Git HEAD commit changes."""
+    logger.info("Detected Git HEAD change for %s; scheduling incremental rebuild", _state["project_path"])
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(build_deep_index(force_rebuild=False))
+    except RuntimeError:
+        pass
+
+
 async def _sync_stale_files():
     """Re-parse files that changed while the server was offline, then embed pending symbols."""
     async with _index_lock:
         state = _state
         if state["deep"] is None:
             return
-
-        stored = state["deep"].store_ref.get_all_files_with_mtime()
-        for row in stored:
-            path = row["path"]
-            stored_mtime = row["mtime"]
-            try:
-                current_mtime = os.stat(path).st_mtime
-            except OSError:
-                # File was deleted — remove it from the index
-                logger.info("Removing deleted file from index: %s", path)
-                state["deep"].store_ref.delete_file(path)
-                continue
-            if _mtime_changed(stored_mtime, current_mtime):
-                logger.info("Re-parsing stale file: %s", path)
-                state["deep"].rebuild_file(path)
+        state["deep"].sync_stale_files()
 
     await _embed_pending()
 
@@ -116,52 +112,52 @@ async def _embed_pending():
             state = _state
             if state["deep"] is None or state["vector"] is None:
                 return
-
-            ollama_ok = await _ollama.is_available()
-            if not ollama_ok:
-                return
-
-            symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
-            if not symbols_needing_embed:
-                return
-
-            builder = state["deep"].builder
-            pending: list[tuple[str, str]] = []
-            file_lines_cache: dict[str, list[str]] = {}
-            pending_by_type: collections.Counter[str] = collections.Counter()
-            skipped_by_reason: collections.Counter[str] = collections.Counter()
-            for sym in symbols_needing_embed:
-                skip_reason = _skip_embedding_reason(sym)
-                if skip_reason:
-                    skipped_by_reason[skip_reason] += 1
-                    continue
-                fp = sym["path"]
-                if fp not in file_lines_cache:
-                    try:
-                        with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
-                            file_lines_cache[fp] = fh.readlines()
-                    except OSError:
-                        file_lines_cache[fp] = []
-                text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
-                pending.append((sym["symbol_id"], text))
-                pending_by_type[sym.get("type", "unknown")] += 1
-
-            logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
-            if skipped_by_reason:
-                logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
-
-            for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                batch = pending[i : i + EMBED_BATCH_SIZE]
-                symbol_ids = [p[0] for p in batch]
-                texts = [p[1] for p in batch]
-                try:
-                    vectors = await _ollama.embed_batch(texts)
-                except ModelNotFoundError:
+            with state["deep"].mutation_lock():
+                ollama_ok = await _ollama.is_available()
+                if not ollama_ok:
                     return
-                if vectors:
-                    state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
-            logger.info("Auto-embedded %d new symbols", len(pending))
-            return
+
+                symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
+                if not symbols_needing_embed:
+                    return
+
+                builder = state["deep"].builder
+                pending: list[tuple[str, str]] = []
+                file_lines_cache: dict[str, list[str]] = {}
+                pending_by_type: collections.Counter[str] = collections.Counter()
+                skipped_by_reason: collections.Counter[str] = collections.Counter()
+                for sym in symbols_needing_embed:
+                    skip_reason = _skip_embedding_reason(sym)
+                    if skip_reason:
+                        skipped_by_reason[skip_reason] += 1
+                        continue
+                    fp = sym["path"]
+                    if fp not in file_lines_cache:
+                        try:
+                            with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+                                file_lines_cache[fp] = fh.readlines()
+                        except OSError:
+                            file_lines_cache[fp] = []
+                    text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
+                    pending.append((sym["symbol_id"], text))
+                    pending_by_type[sym.get("type", "unknown")] += 1
+
+                logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
+                if skipped_by_reason:
+                    logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
+
+                for i in range(0, len(pending), EMBED_BATCH_SIZE):
+                    batch = pending[i : i + EMBED_BATCH_SIZE]
+                    symbol_ids = [p[0] for p in batch]
+                    texts = [p[1] for p in batch]
+                    try:
+                        vectors = await _ollama.embed_batch(texts)
+                    except ModelNotFoundError:
+                        return
+                    if vectors:
+                        state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+                logger.info("Auto-embedded %d new symbols", len(pending))
+                return
 
 
 # ── Embedding filter ──────────────────────────────────────────────────────────
@@ -247,7 +243,7 @@ async def set_project_path(path: str) -> str:
     _state["vector"] = vector
 
     # Start watcher
-    _watcher.start(abs_path, _rebuild_callback)
+    _watcher.start(abs_path, _rebuild_callback, _repo_change_callback)
 
     # Sync files that changed while the server was offline
     asyncio.ensure_future(_sync_stale_files())
@@ -313,72 +309,73 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
         # (watcher runs in a background thread and can race with the build)
         _watcher.stop()
         try:
-            # Phase 1: parse all files
-            build_stats = deep.build(force_rebuild=force_rebuild)
+            with deep.mutation_lock():
+                # Phase 1: parse all files
+                build_stats = deep.build_locked(force_rebuild=force_rebuild)
 
-            # Phase 2: generate embeddings via Ollama
-            embed_count = 0
-            embed_skipped = False
+                # Phase 2: generate embeddings via Ollama
+                embed_count = 0
+                embed_skipped = False
 
-            ollama_ok = await _ollama.is_available()
-            if not ollama_ok:
-                logger.warning(
-                    "Ollama not reachable at %s — skipping embeddings. "
-                    "Run `ollama serve` and pull %s to enable semantic search.",
-                    OLLAMA_BASE_URL,
-                    EMBED_MODEL,
-                )
-                embed_skipped = True
-            else:
-                builder = deep.builder
-
-                # Symbol-level embeddings: find symbols without embeddings yet
-                if force_rebuild:
-                    deep.store_ref.clear_symbol_embeddings()
-                    symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
+                ollama_ok = await _ollama.is_available()
+                if not ollama_ok:
+                    logger.warning(
+                        "Ollama not reachable at %s — skipping embeddings. "
+                        "Run `ollama serve` and pull %s to enable semantic search.",
+                        OLLAMA_BASE_URL,
+                        EMBED_MODEL,
+                    )
+                    embed_skipped = True
                 else:
-                    symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
+                    builder = deep.builder
 
-                symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
-                logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
+                    # Symbol-level embeddings: find symbols without embeddings yet
+                    if force_rebuild:
+                        deep.store_ref.clear_symbol_embeddings()
+                        symbols_needing_embed = deep.store_ref.get_all_symbols_with_file_info()
+                    else:
+                        symbols_needing_embed = deep.store_ref.get_symbols_needing_embedding()
 
-                # Build (symbol_id, embed_text) pairs, skipping low-value symbols.
-                # Cache file lines per path to avoid re-reading the same file for each symbol.
-                pending: list[tuple[str, str]] = []
-                pending_by_type: collections.Counter[str] = collections.Counter()
-                skipped_by_reason: collections.Counter[str] = collections.Counter()
-                for sym in symbols_needing_embed:
-                    skip_reason = _skip_embedding_reason(sym)
-                    if skip_reason:
-                        skipped_by_reason[skip_reason] += 1
-                        continue
-                    fp = sym["path"]
-                    text = builder.build_symbol_embed_text(sym, fp)
-                    pending.append((sym["symbol_id"], text))
-                    pending_by_type[sym.get("type", "unknown")] += 1
+                    symbol_counts = collections.Counter(deep.store_ref.get_symbol_type_counts())
+                    logger.info("Indexed symbols by type: %s", _format_counter(symbol_counts))
 
-                logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
-                if skipped_by_reason:
-                    logger.info("Skipped embedding by reason: %s", _format_counter(skipped_by_reason))
+                    # Build (symbol_id, embed_text) pairs, skipping low-value symbols.
+                    # Cache file lines per path to avoid re-reading the same file for each symbol.
+                    pending: list[tuple[str, str]] = []
+                    pending_by_type: collections.Counter[str] = collections.Counter()
+                    skipped_by_reason: collections.Counter[str] = collections.Counter()
+                    for sym in symbols_needing_embed:
+                        skip_reason = _skip_embedding_reason(sym)
+                        if skip_reason:
+                            skipped_by_reason[skip_reason] += 1
+                            continue
+                        fp = sym["path"]
+                        text = builder.build_symbol_embed_text(sym, fp)
+                        pending.append((sym["symbol_id"], text))
+                        pending_by_type[sym.get("type", "unknown")] += 1
 
-                for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                    batch = pending[i : i + EMBED_BATCH_SIZE]
-                    symbol_ids = [p[0] for p in batch]
-                    texts = [p[1] for p in batch]
-                    try:
-                        vectors = await _ollama.embed_batch(texts)
-                    except ModelNotFoundError as exc:
-                        return {
-                            "error": str(exc),
-                            "files_parsed": build_stats.get("files", 0),
-                            "symbols": build_stats.get("symbols", 0),
-                            "embeddings": embed_count,
-                        }
-                    if vectors:
-                        vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
-                        embed_count += len(vectors)
-                if embed_count > 0:
-                    deep.store_ref.commit()
+                    logger.info("Embeddable symbols by type: %s", _format_counter(pending_by_type))
+                    if skipped_by_reason:
+                        logger.info("Skipped embedding by reason: %s", _format_counter(skipped_by_reason))
+
+                    for i in range(0, len(pending), EMBED_BATCH_SIZE):
+                        batch = pending[i : i + EMBED_BATCH_SIZE]
+                        symbol_ids = [p[0] for p in batch]
+                        texts = [p[1] for p in batch]
+                        try:
+                            vectors = await _ollama.embed_batch(texts)
+                        except ModelNotFoundError as exc:
+                            return {
+                                "error": str(exc),
+                                "files_parsed": build_stats.get("files", 0),
+                                "symbols": build_stats.get("symbols", 0),
+                                "embeddings": embed_count,
+                            }
+                        if vectors:
+                            vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
+                            embed_count += len(vectors)
+                    if embed_count > 0:
+                        deep.store_ref.commit()
 
             return {
                 "files_parsed": build_stats.get("files", 0),
@@ -389,7 +386,7 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
                 "model": EMBED_MODEL if not embed_skipped else None,
             }
         finally:
-            _watcher.start(state["project_path"], _rebuild_callback)
+            _watcher.start(state["project_path"], _rebuild_callback, _repo_change_callback)
 
 
 @mcp.tool()

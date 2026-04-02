@@ -1,5 +1,6 @@
 import logging
 import platform
+import subprocess
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -22,14 +23,49 @@ class DebounceEventHandler(FileSystemEventHandler):
     Skips paths that are under EXCLUDE_DIRS.
     """
 
-    def __init__(self, debounce_secs: float, callback: Callable[[str], None], project_path: str):
+    def __init__(
+        self,
+        debounce_secs: float,
+        callback: Callable[[str], None],
+        project_path: str,
+        repo_change_callback: Optional[Callable[[], None]] = None,
+    ):
         super().__init__()
         self.debounce_secs = debounce_secs
         self.callback = callback
         self.project_path = project_path
+        self.repo_change_callback = repo_change_callback
         self._timer: Optional[threading.Timer] = None
         self._pending: set[str] = set()
         self._lock = threading.Lock()
+        self._last_git_head = self._get_git_head()
+
+    def _get_git_head(self) -> Optional[str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", self.project_path, "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        head = proc.stdout.strip()
+        return head or None
+
+    def _consume_repo_change(self) -> bool:
+        current_head = self._get_git_head()
+        if current_head is None:
+            self._last_git_head = None
+            return False
+        if self._last_git_head is None:
+            self._last_git_head = current_head
+            return False
+        if current_head == self._last_git_head:
+            return False
+        self._last_git_head = current_head
+        return True
 
     def on_any_event(self, event: FileSystemEvent):
         if event.is_directory:
@@ -59,6 +95,13 @@ class DebounceEventHandler(FileSystemEventHandler):
             pending = set(self._pending)
             self._pending.clear()
             self._timer = None
+
+        if self.repo_change_callback is not None and self._consume_repo_change():
+            try:
+                self.repo_change_callback()
+            except Exception:
+                logger.exception("Error in repo change callback for '%s'", self.project_path)
+            return
 
         for path in pending:
             try:
@@ -98,7 +141,12 @@ class FileWatcherService:
         self._monitoring = False
         self._project_path: Optional[str] = None
 
-    def start(self, project_path: str, rebuild_callback: Callable[[str], None]):
+    def start(
+        self,
+        project_path: str,
+        rebuild_callback: Callable[[str], None],
+        repo_change_callback: Optional[Callable[[], None]] = None,
+    ):
         """
         Start watching project_path.
 
@@ -117,6 +165,7 @@ class FileWatcherService:
             debounce_secs=DEBOUNCE_SECS,
             callback=rebuild_callback,
             project_path=project_path,
+            repo_change_callback=repo_change_callback,
         )
 
         observer.schedule(handler, path=project_path, recursive=True)

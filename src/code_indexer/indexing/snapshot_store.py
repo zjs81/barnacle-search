@@ -45,10 +45,13 @@ class SnapshotStore:
     def __init__(self, snapshot_path: str):
         self.snapshot_path = snapshot_path
         self.lock_path = f"{snapshot_path}.lock"
+        self.index_lock_path = f"{snapshot_path}.index.lock"
         self._mutex = threading.RLock()
         Path(snapshot_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.lock_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.lock_path).touch(exist_ok=True)
+        Path(self.index_lock_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.index_lock_path).touch(exist_ok=True)
 
         self._state = self._empty_state()
         self._file_id_to_path: dict[int, str] = {}
@@ -68,7 +71,12 @@ class SnapshotStore:
 
     @contextmanager
     def _file_lock(self, *, exclusive: bool) -> Iterator[None]:
-        with open(self.lock_path, "a+b") as fh:
+        with self._lock_file(self.lock_path, exclusive=exclusive):
+            yield
+
+    @contextmanager
+    def _lock_file(self, lock_path: str, *, exclusive: bool) -> Iterator[None]:
+        with open(lock_path, "a+b") as fh:
             if fcntl is not None:
                 mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
                 fcntl.flock(fh.fileno(), mode)
@@ -90,6 +98,11 @@ class SnapshotStore:
             finally:
                 fh.seek(0)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
+    @contextmanager
+    def interprocess_lock(self, *, exclusive: bool = True) -> Iterator[None]:
+        with self._lock_file(self.index_lock_path, exclusive=exclusive):
+            yield
 
     def _serialize_state(self) -> bytes:
         payload = json.dumps(self._state, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -129,6 +142,9 @@ class SnapshotStore:
 
             self._state = self._normalize_state(self._deserialize_state(raw))
             self._rebuild_indexes()
+
+    def refresh_from_disk(self) -> None:
+        self._load_from_disk()
 
     def _normalize_state(self, data: dict) -> dict:
         state = self._empty_state()

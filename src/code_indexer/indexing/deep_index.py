@@ -3,6 +3,7 @@ High-level orchestrator for building and querying the deep snapshot-backed index
 Used directly by server.py.
 """
 
+from contextlib import contextmanager
 import logging
 import os
 from typing import Optional
@@ -33,7 +34,17 @@ class DeepIndex:
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
+    @contextmanager
+    def mutation_lock(self):
+        with self.store.interprocess_lock(exclusive=True):
+            self.store.refresh_from_disk()
+            yield
+
     def build(self, force_rebuild: bool = False) -> dict:
+        with self.mutation_lock():
+            return self.build_locked(force_rebuild=force_rebuild)
+
+    def build_locked(self, force_rebuild: bool = False) -> dict:
         """
         Build (or rebuild) the deep index.
 
@@ -224,8 +235,28 @@ class DeepIndex:
         }
 
     def rebuild_file(self, file_path: str) -> bool:
+        with self.mutation_lock():
+            return self.rebuild_file_locked(file_path)
+
+    def rebuild_file_locked(self, file_path: str) -> bool:
         """Delegate to builder.rebuild_file for incremental watcher updates."""
         return self.builder.rebuild_file(file_path)
+
+    def sync_stale_files(self) -> None:
+        with self.mutation_lock():
+            stored = self.store.get_all_files_with_mtime()
+            for row in stored:
+                path = row["path"]
+                stored_mtime = row["mtime"]
+                try:
+                    current_mtime = os.stat(path).st_mtime
+                except OSError:
+                    log.info("Removing deleted file from index: %s", path)
+                    self.store.delete_file(path)
+                    continue
+                if _mtime_changed(stored_mtime, current_mtime):
+                    log.info("Re-parsing stale file: %s", path)
+                    self.rebuild_file_locked(path)
 
     # ── Properties ────────────────────────────────────────────────────────────
 

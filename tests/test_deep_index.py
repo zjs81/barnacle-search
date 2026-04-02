@@ -31,3 +31,35 @@ namespace MyApp.Services
 def test_mtime_changed_ignores_float_noise():
     assert _mtime_changed(100.1234564, 100.12345649) is False
     assert _mtime_changed(100.123456, 100.123457) is True
+
+
+def test_rebuild_file_refreshes_shared_snapshot_before_mutation(tmp_path):
+    foo_path = tmp_path / "foo.py"
+    foo_path.write_text(
+        """\
+def foo():
+    return 1
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "index.bin"
+
+    deep_a = DeepIndex(str(tmp_path), str(db_path), StrategyFactory())
+    deep_b = DeepIndex(str(tmp_path), str(db_path), StrategyFactory())
+
+    deep_a.build(force_rebuild=True)
+
+    bar_path = tmp_path / "bar.py"
+    bar_path.write_text(
+        """\
+def bar():
+    return 2
+""",
+        encoding="utf-8",
+    )
+
+    assert deep_b.rebuild_file(str(bar_path)) is True
+
+    reloaded = DeepIndex(str(tmp_path), str(db_path), StrategyFactory())
+    assert reloaded.get_file_summary(str(foo_path)) is not None
+    assert reloaded.get_file_summary(str(bar_path)) is not None
