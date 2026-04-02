@@ -71,3 +71,25 @@ def test_on_any_event_only_tracks_supported_non_excluded_files(tmp_path, monkeyp
     assert handler._pending == {str(tmp_path / "src" / "main.py")}
     if handler._timer is not None:
         handler._timer.cancel()
+
+
+def test_close_cancels_pending_timer(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        DebounceEventHandler,
+        "_get_git_head",
+        lambda self: None,
+    )
+
+    handler = DebounceEventHandler(
+        debounce_secs=0.01,
+        callback=lambda path: None,
+        project_path=str(tmp_path),
+    )
+
+    handler.on_any_event(FileModifiedEvent(str(tmp_path / "src" / "main.py")))
+    assert handler._timer is not None
+
+    handler.close()
+
+    assert handler._timer is None
+    assert handler._pending == set()

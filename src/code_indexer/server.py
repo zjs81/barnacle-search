@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import time
+from enum import Enum
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -44,6 +45,8 @@ _ollama = OllamaClient(base_url=OLLAMA_BASE_URL, model=EMBED_MODEL)
 _watcher = FileWatcherService()
 _index_lock = asyncio.Lock()
 _embed_lock = asyncio.Lock()
+_build_task: Optional[asyncio.Task] = None
+_background_tasks: set[asyncio.Task] = set()
 
 # Mutable state — replaced each time set_project_path is called
 _state: dict = {
@@ -53,8 +56,44 @@ _state: dict = {
     "deep": None,      # DeepIndex
     "vector": None,    # VectorStore
 }
+
+
+class BuildStatus(str, Enum):
+    IDLE = "idle"
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+_ACTIVE_BUILD_STATUSES = {BuildStatus.QUEUED.value, BuildStatus.RUNNING.value}
+_BUILD_STATE_TRANSITIONS: dict[str, set[str]] = {
+    BuildStatus.IDLE.value: {
+        BuildStatus.QUEUED.value,
+        BuildStatus.COMPLETED.value,
+        BuildStatus.FAILED.value,
+    },
+    BuildStatus.QUEUED.value: {
+        BuildStatus.RUNNING.value,
+        BuildStatus.COMPLETED.value,
+        BuildStatus.FAILED.value,
+    },
+    BuildStatus.RUNNING.value: {
+        BuildStatus.COMPLETED.value,
+        BuildStatus.FAILED.value,
+    },
+    BuildStatus.COMPLETED.value: {
+        BuildStatus.QUEUED.value,
+        BuildStatus.FAILED.value,
+    },
+    BuildStatus.FAILED.value: {
+        BuildStatus.QUEUED.value,
+        BuildStatus.COMPLETED.value,
+    },
+}
+
+
 _build_state: dict = {
-    "task": None,
     "status": "idle",
     "project_path": None,
     "force_rebuild": False,
@@ -87,10 +126,13 @@ def _require_project() -> dict:
 
 
 def _reset_build_state(project_path: Optional[str] = None) -> None:
+    global _build_task
+    _cancel_task(_build_task)
+    _build_task = None
+    _cancel_background_tasks()
     _build_state.update(
         {
-            "task": None,
-            "status": "idle",
+            "status": BuildStatus.IDLE.value,
             "project_path": project_path,
             "force_rebuild": False,
             "started_at": None,
@@ -106,6 +148,21 @@ def _reset_build_state(project_path: Optional[str] = None) -> None:
             "error": None,
         }
     )
+
+
+def _transition_build_state(status: BuildStatus | str, **updates) -> None:
+    next_status = status.value if isinstance(status, BuildStatus) else status
+    current_status = _build_state["status"]
+    allowed = _BUILD_STATE_TRANSITIONS.get(current_status, set())
+    if next_status != current_status and next_status not in allowed:
+        raise ValueError(f"Invalid build state transition: {current_status} -> {next_status}")
+    _build_state["status"] = next_status
+    if updates:
+        _build_state.update(updates)
+
+
+def _is_build_in_progress() -> bool:
+    return _build_state["status"] in _ACTIVE_BUILD_STATUSES
 
 
 def _recompute_eta() -> None:
@@ -142,12 +199,10 @@ def _set_build_progress(phase: str, completed: int, total: int, *, message: Opti
 
 
 def _get_indexing_status() -> dict:
-    task = _build_state["task"]
-    in_progress = bool(task and not task.done())
     _recompute_eta()
     return {
         "status": _build_state["status"],
-        "in_progress": in_progress,
+        "in_progress": _is_build_in_progress(),
         "project_path": _build_state["project_path"],
         "force_rebuild": _build_state["force_rebuild"],
         "started_at": _build_state["started_at"],
@@ -164,9 +219,9 @@ def _get_indexing_status() -> dict:
 
 
 def _start_build_job(force_rebuild: bool) -> dict:
+    global _build_task
     state = _require_project()
-    task = _build_state["task"]
-    if task and not task.done():
+    if _is_build_in_progress():
         _build_state["message"] = (
             "Deep index build already in progress. Call get_index_status() to track progress."
         )
@@ -176,25 +231,23 @@ def _start_build_job(force_rebuild: bool) -> dict:
             "indexing": _get_indexing_status(),
         }
 
-    _build_state.update(
-        {
-            "task": None,
-            "status": "queued",
-            "project_path": state["project_path"],
-            "force_rebuild": force_rebuild,
-            "started_at": time.time(),
-            "finished_at": None,
-            "phase": "queued",
-            "phase_started_at": time.time(),
-            "completed": 0,
-            "total": 0,
-            "percent_done": 0.0,
-            "eta_seconds": None,
-            "message": "Deep index build queued. Call get_index_status() to track progress.",
-            "result": None,
-            "error": None,
-        }
+    _transition_build_state(
+        BuildStatus.QUEUED,
+        project_path=state["project_path"],
+        force_rebuild=force_rebuild,
+        started_at=time.time(),
+        finished_at=None,
+        phase="queued",
+        phase_started_at=time.time(),
+        completed=0,
+        total=0,
+        percent_done=0.0,
+        eta_seconds=None,
+        message="Deep index build queued. Call get_index_status() to track progress.",
+        result=None,
+        error=None,
     )
+
     task = asyncio.create_task(
         _run_deep_index_build(
             project_path=state["project_path"],
@@ -203,12 +256,69 @@ def _start_build_job(force_rebuild: bool) -> dict:
             force_rebuild=force_rebuild,
         )
     )
-    _build_state["task"] = task
+    _build_task = task
+    task.add_done_callback(_finalize_build_task)
     return {
         "status": "started",
         "message": "Deep index build started. Call get_index_status() to track progress.",
         "indexing": _get_indexing_status(),
     }
+
+
+def _finalize_build_task(task: asyncio.Task) -> None:
+    global _build_task
+    if _build_task is task:
+        _build_task = None
+
+    if not _is_build_in_progress():
+        return
+
+    if task.cancelled():
+        _transition_build_state(
+            BuildStatus.FAILED,
+            finished_at=time.time(),
+            error="Deep index build task was cancelled.",
+            message="Deep index build failed. Call get_index_status() for details.",
+        )
+        return
+
+    exc = task.exception()
+    if exc is not None:
+        _transition_build_state(
+            BuildStatus.FAILED,
+            finished_at=time.time(),
+            error=str(exc),
+            message="Deep index build failed. Call get_index_status() for details.",
+        )
+
+
+def _cancel_task(task: Optional[asyncio.Task]) -> None:
+    if task is not None and hasattr(task, "done") and hasattr(task, "cancel") and not task.done():
+        task.cancel()
+
+
+def _cancel_background_tasks() -> None:
+    tasks = tuple(_background_tasks)
+    for task in tasks:
+        _cancel_task(task)
+    _background_tasks.clear()
+
+
+def _finalize_background_task(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Background task finalization failed")
+
+
+def _spawn_background_task(coro: asyncio.coroutines) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_finalize_background_task)
+    return task
 
 
 def _rebuild_callback(file_path: str):
@@ -222,7 +332,7 @@ def _rebuild_callback(file_path: str):
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(_embed_pending())
+            _spawn_background_task(_embed_pending())
     except RuntimeError:
         pass
 
@@ -233,7 +343,7 @@ def _repo_change_callback():
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(build_deep_index(force_rebuild=False))
+            _spawn_background_task(build_deep_index(force_rebuild=False))
     except RuntimeError:
         pass
 
@@ -330,8 +440,10 @@ async def _run_deep_index_build(
     build_stats: dict = {"files": 0, "symbols": 0, "errors": 0}
     try:
         async with _index_lock:
-            _build_state["status"] = "running"
-            _build_state["message"] = "Parsing files for the deep index."
+            _transition_build_state(
+                BuildStatus.RUNNING,
+                message="Parsing files for the deep index.",
+            )
 
             # Stop file watcher during build to prevent concurrent DB writes
             _watcher.stop()
@@ -422,17 +534,17 @@ async def _run_deep_index_build(
                         try:
                             results = await asyncio.gather(*coros)
                         except ModelNotFoundError as exc:
-                            _build_state["status"] = "failed"
-                            _build_state["error"] = str(exc)
-                            _build_state["finished_at"] = time.time()
-                            _build_state["message"] = (
-                                "Deep index build failed. Call get_index_status() for details."
+                            _transition_build_state(
+                                BuildStatus.FAILED,
+                                error=str(exc),
+                                finished_at=time.time(),
+                                message="Deep index build failed. Call get_index_status() for details.",
+                                result={
+                                    "files_parsed": build_stats.get("files", 0),
+                                    "symbols": build_stats.get("symbols", 0),
+                                    "embeddings": embed_count,
+                                },
                             )
-                            _build_state["result"] = {
-                                "files_parsed": build_stats.get("files", 0),
-                                "symbols": build_stats.get("symbols", 0),
-                                "embeddings": embed_count,
-                            }
                             return
                         for batch, vectors in zip(wave, results):
                             if vectors:
@@ -449,17 +561,19 @@ async def _run_deep_index_build(
                     if embed_count > 0:
                         deep.store_ref.commit()
 
-                _build_state["status"] = "completed"
-                _build_state["finished_at"] = time.time()
-                _build_state["message"] = "Deep index build completed."
-                _build_state["result"] = {
-                    "files_parsed": build_stats.get("files", 0),
-                    "symbols": build_stats.get("symbols", 0),
-                    "errors": build_stats.get("errors", 0),
-                    "embeddings": embed_count,
-                    "embeddings_skipped": embed_skipped,
-                    "model": EMBED_MODEL if not embed_skipped else None,
-                }
+                _transition_build_state(
+                    BuildStatus.COMPLETED,
+                    finished_at=time.time(),
+                    message="Deep index build completed.",
+                    result={
+                        "files_parsed": build_stats.get("files", 0),
+                        "symbols": build_stats.get("symbols", 0),
+                        "errors": build_stats.get("errors", 0),
+                        "embeddings": embed_count,
+                        "embeddings_skipped": embed_skipped,
+                        "model": EMBED_MODEL if not embed_skipped else None,
+                    },
+                )
                 if _build_state["phase"] != "embedding":
                     _set_build_progress(
                         "parsing",
@@ -478,10 +592,12 @@ async def _run_deep_index_build(
                 if _state["project_path"] == project_path and _state["deep"] is deep:
                     _watcher.start(project_path, _rebuild_callback, _repo_change_callback)
     except Exception as exc:
-        _build_state["status"] = "failed"
-        _build_state["finished_at"] = time.time()
-        _build_state["error"] = str(exc)
-        _build_state["message"] = "Deep index build failed. Call get_index_status() for details."
+        _transition_build_state(
+            BuildStatus.FAILED,
+            finished_at=time.time(),
+            error=str(exc),
+            message="Deep index build failed. Call get_index_status() for details.",
+        )
         logger.exception("Deep index build failed")
 
 
@@ -572,7 +688,7 @@ async def set_project_path(path: str) -> str:
     _watcher.start(abs_path, _rebuild_callback, _repo_change_callback)
 
     # Sync files that changed while the server was offline
-    asyncio.ensure_future(_sync_stale_files())
+    _spawn_background_task(_sync_stale_files())
 
     stats = shallow.get_stats()
     lang_summary = ", ".join(

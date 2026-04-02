@@ -40,6 +40,13 @@ class DebounceEventHandler(FileSystemEventHandler):
         self._lock = threading.Lock()
         self._last_git_head = self._get_git_head()
 
+    def close(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._pending.clear()
+
     def _get_git_head(self) -> Optional[str]:
         try:
             proc = subprocess.run(
@@ -138,6 +145,7 @@ def _make_observer():
 class FileWatcherService:
     def __init__(self):
         self._observer = None
+        self._handler: Optional[DebounceEventHandler] = None
         self._monitoring = False
         self._project_path: Optional[str] = None
 
@@ -172,6 +180,7 @@ class FileWatcherService:
         observer.start()
 
         self._observer = observer
+        self._handler = handler
         self._project_path = project_path
         self._monitoring = True
         logger.info(
@@ -182,6 +191,14 @@ class FileWatcherService:
 
     def stop(self):
         """Stop watching. Safe to call even if not started."""
+        if self._handler is not None:
+            try:
+                self._handler.close()
+            except Exception:
+                logger.exception("FileWatcherService: error closing handler")
+            finally:
+                self._handler = None
+
         if self._observer is not None:
             try:
                 self._observer.stop()
