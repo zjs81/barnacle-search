@@ -544,6 +544,14 @@ Required workflow:
 
 Never call `get_index_status()`, `semantic_search()`, `find_files()`, `search_code()`, `get_file_summary()`, or `get_symbol_body()` before `set_project_path()`.
 
+While the deep index is building (`build_deep_index()` in progress):
+- `search_code(pattern="...")` always works (uses ripgrep, no index needed).
+- `find_files(pattern="...")` always works (uses the shallow index built by `set_project_path()`).
+- `get_file_summary()`, `get_symbol_body()`, and `semantic_search()` depend on the deep index; they may return partial or no results until the build completes.
+- Use `get_index_status()` to check build progress.
+
+If Barnacle tools are rejected, unavailable, or return errors, fall back to shell search immediately — do not wait or retry.
+
 If Barnacle results are low-signal, the index is not ready, or the task is an exact string/path lookup, fall back to shell search immediately.
 <!-- barnacle-search:claude-guidance:end -->
 """
@@ -663,6 +671,14 @@ Required workflow:
 
 Never call `get_index_status()`, `semantic_search()`, `find_files()`, `search_code()`, `get_file_summary()`, or `get_symbol_body()` before `set_project_path()`.
 
+While the deep index is building (`build_deep_index()` in progress):
+- `search_code(pattern="...")` always works (uses ripgrep, no index needed).
+- `find_files(pattern="...")` always works (uses the shallow index built by `set_project_path()`).
+- `get_file_summary()`, `get_symbol_body()`, and `semantic_search()` depend on the deep index; they may return partial or no results until the build completes.
+- Use `get_index_status()` to check build progress.
+
+If Barnacle tools are rejected, unavailable, or return errors, fall back to `rg` immediately — do not wait or retry.
+
 If Barnacle results are low-signal, the index is not ready, or the user asks for an exact string/path lookup, fall back to `rg` immediately.
 <!-- barnacle-search:codex-guidance:end -->
 """
@@ -762,6 +778,14 @@ Required workflow:
 5. Use shell search only after Barnacle has narrowed the area, or immediately for exact identifier, exact string, or exact path lookup.
 
 Never call `get_index_status()`, `semantic_search()`, `find_files()`, `search_code()`, `get_file_summary()`, or `get_symbol_body()` before `set_project_path()`.
+
+While the deep index is building (`build_deep_index()` in progress):
+- `search_code(pattern="...")` always works (uses ripgrep, no index needed).
+- `find_files(pattern="...")` always works (uses the shallow index built by `set_project_path()`).
+- `get_file_summary()`, `get_symbol_body()`, and `semantic_search()` depend on the deep index; they may return partial or no results until the build completes.
+- Use `get_index_status()` to check build progress.
+
+If Barnacle tools are rejected, unavailable, or return errors, fall back to shell search immediately — do not wait or retry.
 
 If Barnacle results are low-signal, the index is not ready, or the task is an exact string/path lookup, fall back to shell search immediately.
 <!-- barnacle-search:opencode-guidance:end -->
