@@ -143,6 +143,7 @@ def _set_build_progress(phase: str, completed: int, total: int, *, message: Opti
 def _get_indexing_status() -> dict:
     task = _build_state["task"]
     in_progress = bool(task and not task.done())
+    _recompute_eta()
     return {
         "status": _build_state["status"],
         "in_progress": in_progress,
