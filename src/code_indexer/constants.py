@@ -31,6 +31,7 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 EMBED_MODEL = "granite-embedding"
 
 EMBED_BATCH_SIZE = max(1, int(os.getenv("BARNACLE_EMBED_BATCH_SIZE", "64")))
+EMBED_CONCURRENT_BATCHES = max(1, int(os.getenv("BARNACLE_EMBED_CONCURRENCY", "4")))
 
 DEBOUNCE_SECS = 0.5
 INDEX_MAX_WORKERS = max(1, int((os.cpu_count() or 4) * 0.75))

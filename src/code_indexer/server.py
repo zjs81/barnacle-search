@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from .constants import (
     DEEP_INDEX_SNAPSHOT_FILE,
     EMBED_BATCH_SIZE,
+    EMBED_CONCURRENT_BATCHES,
     EMBED_MODEL,
     OLLAMA_BASE_URL,
     SHALLOW_INDEX_FILE,
@@ -297,16 +298,24 @@ async def _embed_pending():
             if pending is None:
                 return
 
-            for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                batch = pending[i : i + EMBED_BATCH_SIZE]
-                symbol_ids = [p[0] for p in batch]
-                texts = [p[1] for p in batch]
+            all_batches = [
+                pending[i : i + EMBED_BATCH_SIZE]
+                for i in range(0, len(pending), EMBED_BATCH_SIZE)
+            ]
+            for wave_start in range(0, len(all_batches), EMBED_CONCURRENT_BATCHES):
+                wave = all_batches[wave_start : wave_start + EMBED_CONCURRENT_BATCHES]
+                coros = [
+                    _ollama.embed_batch([t for _, t in batch])
+                    for batch in wave
+                ]
                 try:
-                    vectors = await _ollama.embed_batch(texts)
+                    results = await asyncio.gather(*coros)
                 except ModelNotFoundError:
                     return
-                if vectors:
-                    state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+                for batch, vectors in zip(wave, results):
+                    if vectors:
+                        symbol_ids = [sid for sid, _ in batch]
+                        state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
             logger.info("Auto-embedded %d new symbols", len(pending))
             return
 
@@ -392,19 +401,26 @@ async def _run_deep_index_build(
 
                     pending = await asyncio.to_thread(_collect_pending)
 
-                    # Phase 3: Embed batches (async, on event loop)
+                    # Phase 3: Embed batches concurrently
                     _set_build_progress(
                         "embedding",
                         0,
                         len(pending),
                         message="Generating embeddings for semantic search.",
                     )
-                    for i in range(0, len(pending), EMBED_BATCH_SIZE):
-                        batch = pending[i : i + EMBED_BATCH_SIZE]
-                        symbol_ids = [p[0] for p in batch]
-                        texts = [p[1] for p in batch]
+                    all_batches = [
+                        pending[i : i + EMBED_BATCH_SIZE]
+                        for i in range(0, len(pending), EMBED_BATCH_SIZE)
+                    ]
+                    completed_symbols = 0
+                    for wave_start in range(0, len(all_batches), EMBED_CONCURRENT_BATCHES):
+                        wave = all_batches[wave_start : wave_start + EMBED_CONCURRENT_BATCHES]
+                        coros = [
+                            _ollama.embed_batch([t for _, t in batch])
+                            for batch in wave
+                        ]
                         try:
-                            vectors = await _ollama.embed_batch(texts)
+                            results = await asyncio.gather(*coros)
                         except ModelNotFoundError as exc:
                             _build_state["status"] = "failed"
                             _build_state["error"] = str(exc)
@@ -418,12 +434,15 @@ async def _run_deep_index_build(
                                 "embeddings": embed_count,
                             }
                             return
-                        if vectors:
-                            vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
-                            embed_count += len(vectors)
+                        for batch, vectors in zip(wave, results):
+                            if vectors:
+                                symbol_ids = [sid for sid, _ in batch]
+                                vector.bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors, commit=False)
+                                embed_count += len(vectors)
+                            completed_symbols += len(batch)
                         _set_build_progress(
                             "embedding",
-                            min(i + len(batch), len(pending)),
+                            min(completed_symbols, len(pending)),
                             len(pending),
                             message="Generating embeddings for semantic search.",
                         )
