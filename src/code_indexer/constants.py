@@ -34,5 +34,9 @@ EMBED_BATCH_SIZE = max(1, int(os.getenv("BARNACLE_EMBED_BATCH_SIZE", "64")))
 EMBED_CONCURRENT_BATCHES = max(1, int(os.getenv("BARNACLE_EMBED_CONCURRENCY", "4")))
 
 DEBOUNCE_SECS = 0.5
-INDEX_MAX_WORKERS = max(1, int((os.cpu_count() or 4) * 0.75))
+_DEFAULT_INDEX_WORKERS = max(1, (os.cpu_count() or 4) // 2)
+INDEX_MAX_WORKERS = max(
+    1,
+    int(os.getenv("BARNACLE_INDEX_WORKERS", str(_DEFAULT_INDEX_WORKERS))),
+)
 MTIME_PRECISION_DIGITS = 6

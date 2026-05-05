@@ -12,11 +12,14 @@ import collections
 import hashlib
 import logging
 import os
+import threading
 import time
+from contextlib import contextmanager
 from enum import Enum
-from typing import Optional
+from typing import Coroutine, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from .constants import (
     DEEP_INDEX_SNAPSHOT_FILE,
@@ -47,6 +50,9 @@ _index_lock = asyncio.Lock()
 _embed_lock = asyncio.Lock()
 _build_task: Optional[asyncio.Task] = None
 _background_tasks: set[asyncio.Task] = set()
+_activity_stack: list[dict] = []
+_activity_lock = threading.RLock()
+_server_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # Mutable state — replaced each time set_project_path is called
 _state: dict = {
@@ -165,6 +171,52 @@ def _is_build_in_progress() -> bool:
     return _build_state["status"] in _ACTIVE_BUILD_STATUSES
 
 
+def _current_activity() -> Optional[dict]:
+    with _activity_lock:
+        return _activity_stack[-1] if _activity_stack else None
+
+
+@contextmanager
+def _track_index_activity(phase: str, message: str):
+    token = {
+        "phase": phase,
+        "message": message,
+        "started_at": time.time(),
+    }
+    with _activity_lock:
+        _activity_stack.append(token)
+    try:
+        yield token
+    finally:
+        with _activity_lock:
+            if token in _activity_stack:
+                _activity_stack.remove(token)
+
+
+def _get_activity_backed_status() -> Optional[dict]:
+    if _build_state["status"] == BuildStatus.RUNNING.value:
+        return None
+
+    activity = _current_activity()
+    if activity is None:
+        return None
+
+    status = _build_state.copy()
+    status["status"] = BuildStatus.RUNNING.value
+    status["started_at"] = status["started_at"] or activity["started_at"]
+    status["finished_at"] = None
+    status["phase"] = activity["phase"]
+    status["phase_started_at"] = activity["started_at"]
+    status["completed"] = 0
+    status["total"] = 0
+    status["percent_done"] = 0.0
+    status["eta_seconds"] = None
+    status["message"] = activity["message"]
+    status["result"] = None
+    status["error"] = None
+    return status
+
+
 def _recompute_eta() -> None:
     phase_started_at = _build_state["phase_started_at"]
     completed = _build_state["completed"]
@@ -199,22 +251,28 @@ def _set_build_progress(phase: str, completed: int, total: int, *, message: Opti
 
 
 def _get_indexing_status() -> dict:
-    _recompute_eta()
+    effective_state = _get_activity_backed_status()
+    if effective_state is None:
+        _recompute_eta()
+        effective_state = _build_state
     return {
-        "status": _build_state["status"],
-        "in_progress": _is_build_in_progress(),
-        "project_path": _build_state["project_path"],
-        "force_rebuild": _build_state["force_rebuild"],
-        "started_at": _build_state["started_at"],
-        "finished_at": _build_state["finished_at"],
-        "phase": _build_state["phase"],
-        "completed": _build_state["completed"],
-        "total": _build_state["total"],
-        "percent_done": _build_state["percent_done"],
-        "eta_seconds": _build_state["eta_seconds"],
-        "message": _build_state["message"],
-        "result": _build_state["result"],
-        "error": _build_state["error"],
+        "status": effective_state["status"],
+        "in_progress": (
+            effective_state["status"] in _ACTIVE_BUILD_STATUSES
+            or _current_activity() is not None
+        ),
+        "project_path": effective_state["project_path"],
+        "force_rebuild": effective_state["force_rebuild"],
+        "started_at": effective_state["started_at"],
+        "finished_at": effective_state["finished_at"],
+        "phase": effective_state["phase"],
+        "completed": effective_state["completed"],
+        "total": effective_state["total"],
+        "percent_done": effective_state["percent_done"],
+        "eta_seconds": effective_state["eta_seconds"],
+        "message": effective_state["message"],
+        "result": effective_state["result"],
+        "error": effective_state["error"],
     }
 
 
@@ -314,11 +372,41 @@ def _finalize_background_task(task: asyncio.Task) -> None:
         logger.exception("Background task finalization failed")
 
 
-def _spawn_background_task(coro: asyncio.coroutines) -> asyncio.Task:
+def _remember_server_loop() -> None:
+    global _server_loop
+    try:
+        _server_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+
+def _spawn_background_task(coro: Coroutine) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_finalize_background_task)
     return task
+
+
+def _schedule_background_task(coro: Coroutine) -> Optional[asyncio.Task]:
+    """Schedule a coroutine from the server loop or a watcher thread."""
+    loop = _server_loop
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is not None:
+        if loop is None:
+            _remember_server_loop()
+        return _spawn_background_task(coro)
+
+    if loop is None or loop.is_closed() or not loop.is_running():
+        coro.close()
+        return None
+
+    loop.call_soon_threadsafe(_spawn_background_task, coro)
+    return None
 
 
 def _rebuild_callback(file_path: str):
@@ -327,107 +415,100 @@ def _rebuild_callback(file_path: str):
     if state["deep"] is None:
         return
     logger.info("Auto-reindexing: %s", file_path)
-    state["deep"].rebuild_file(file_path)
+    with _track_index_activity("rebuild", f"Re-indexing changed file: {file_path}"):
+        state["deep"].rebuild_file(file_path)
     # Schedule embedding for new symbols in the background
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            _spawn_background_task(_embed_pending())
-    except RuntimeError:
-        pass
+    _schedule_background_task(_embed_pending())
 
 
 def _repo_change_callback():
     """Called by the file watcher when the Git HEAD commit changes."""
     logger.info("Detected Git HEAD change for %s; scheduling incremental rebuild", _state["project_path"])
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            _spawn_background_task(build_deep_index(force_rebuild=False))
-    except RuntimeError:
-        pass
+    _schedule_background_task(build_deep_index(force_rebuild=False))
 
 
 async def _sync_stale_files():
     """Re-parse files that changed while the server was offline, then embed pending symbols."""
-    async with _index_lock:
-        state = _state
-        if state["deep"] is None:
-            return
-        await asyncio.to_thread(state["deep"].sync_stale_files)
+    with _track_index_activity("sync", "Synchronizing files changed while the server was offline."):
+        async with _index_lock:
+            state = _state
+            if state["deep"] is None:
+                return
+            await asyncio.to_thread(state["deep"].sync_stale_files)
 
     await _embed_pending()
 
 
 async def _embed_pending():
     """Embed any symbols that don't have vectors yet."""
-    async with _embed_lock:
-        while True:
-            state = _state
-            if state["deep"] is None or state["vector"] is None:
-                return
-
-            ollama_ok = await _ollama.is_available()
-            if not ollama_ok:
-                return
-
-            # Collect pending symbols in a thread to avoid blocking the event loop
-            def _collect():
-                with state["deep"].mutation_lock():
-                    symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
-                    if not symbols_needing_embed:
-                        return None
-
-                    builder = state["deep"].builder
-                    pending: list[tuple[str, str]] = []
-                    file_lines_cache: dict[str, list[str]] = {}
-                    pending_by_type: collections.Counter[str] = collections.Counter()
-                    skipped_by_reason: collections.Counter[str] = collections.Counter()
-                    for sym in symbols_needing_embed:
-                        skip_reason = _skip_embedding_reason(sym)
-                        if skip_reason:
-                            skipped_by_reason[skip_reason] += 1
-                            continue
-                        fp = sym["path"]
-                        if fp not in file_lines_cache:
-                            try:
-                                with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
-                                    file_lines_cache[fp] = fh.readlines()
-                            except OSError:
-                                file_lines_cache[fp] = []
-                        text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
-                        pending.append((sym["symbol_id"], text))
-                        pending_by_type[sym.get("type", "unknown")] += 1
-
-                    logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
-                    if skipped_by_reason:
-                        logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
-                    return pending
-
-            pending = await asyncio.to_thread(_collect)
-            if pending is None:
-                return
-
-            all_batches = [
-                pending[i : i + EMBED_BATCH_SIZE]
-                for i in range(0, len(pending), EMBED_BATCH_SIZE)
-            ]
-            for wave_start in range(0, len(all_batches), EMBED_CONCURRENT_BATCHES):
-                wave = all_batches[wave_start : wave_start + EMBED_CONCURRENT_BATCHES]
-                coros = [
-                    _ollama.embed_batch([t for _, t in batch])
-                    for batch in wave
-                ]
-                try:
-                    results = await asyncio.gather(*coros)
-                except ModelNotFoundError:
+    with _track_index_activity("embedding", "Generating embeddings for semantic search."):
+        async with _embed_lock:
+            while True:
+                state = _state
+                if state["deep"] is None or state["vector"] is None:
                     return
-                for batch, vectors in zip(wave, results):
-                    if vectors:
-                        symbol_ids = [sid for sid, _ in batch]
-                        state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
-            logger.info("Auto-embedded %d new symbols", len(pending))
-            return
+
+                ollama_ok = await _ollama.is_available()
+                if not ollama_ok:
+                    return
+
+                # Collect pending symbols in a thread to avoid blocking the event loop
+                def _collect():
+                    with state["deep"].mutation_lock():
+                        symbols_needing_embed = state["deep"].store_ref.get_symbols_needing_embedding()
+                        if not symbols_needing_embed:
+                            return None
+
+                        builder = state["deep"].builder
+                        pending: list[tuple[str, str]] = []
+                        file_lines_cache: dict[str, list[str]] = {}
+                        pending_by_type: collections.Counter[str] = collections.Counter()
+                        skipped_by_reason: collections.Counter[str] = collections.Counter()
+                        for sym in symbols_needing_embed:
+                            skip_reason = _skip_embedding_reason(sym)
+                            if skip_reason:
+                                skipped_by_reason[skip_reason] += 1
+                                continue
+                            fp = sym["path"]
+                            if fp not in file_lines_cache:
+                                try:
+                                    with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+                                        file_lines_cache[fp] = fh.readlines()
+                                except OSError:
+                                    file_lines_cache[fp] = []
+                            text = builder.build_symbol_embed_text(sym, fp, file_lines_cache[fp])
+                            pending.append((sym["symbol_id"], text))
+                            pending_by_type[sym.get("type", "unknown")] += 1
+
+                        logger.info("Pending auto-embed symbols by type: %s", _format_counter(pending_by_type))
+                        if skipped_by_reason:
+                            logger.info("Auto-embed skipped symbols by reason: %s", _format_counter(skipped_by_reason))
+                        return pending
+
+                pending = await asyncio.to_thread(_collect)
+                if pending is None:
+                    return
+
+                all_batches = [
+                    pending[i : i + EMBED_BATCH_SIZE]
+                    for i in range(0, len(pending), EMBED_BATCH_SIZE)
+                ]
+                for wave_start in range(0, len(all_batches), EMBED_CONCURRENT_BATCHES):
+                    wave = all_batches[wave_start : wave_start + EMBED_CONCURRENT_BATCHES]
+                    coros = [
+                        _ollama.embed_batch([t for _, t in batch])
+                        for batch in wave
+                    ]
+                    try:
+                        results = await asyncio.gather(*coros)
+                    except ModelNotFoundError:
+                        return
+                    for batch, vectors in zip(wave, results):
+                        if vectors:
+                            symbol_ids = [sid for sid, _ in batch]
+                            state["vector"].bulk_upsert_symbols(symbol_ids, EMBED_MODEL, vectors)
+                logger.info("Auto-embedded %d new symbols", len(pending))
+                return
 
 
 async def _run_deep_index_build(
@@ -639,6 +720,12 @@ def _format_counter(counter: collections.Counter) -> str:
 # ── MCP server ────────────────────────────────────────────────────────────────
 
 mcp = FastMCP("barnacle-search")
+_READ_ONLY_TOOL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
 @mcp.tool()
@@ -656,6 +743,7 @@ async def set_project_path(path: str) -> str:
     Returns:
         Status message with file count and detected languages.
     """
+    _remember_server_loop()
     abs_path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isdir(abs_path):
         raise ValueError(f"Not a directory: {abs_path}")
@@ -688,7 +776,7 @@ async def set_project_path(path: str) -> str:
     _watcher.start(abs_path, _rebuild_callback, _repo_change_callback)
 
     # Sync files that changed while the server was offline
-    _spawn_background_task(_sync_stale_files())
+    _schedule_background_task(_sync_stale_files())
 
     stats = shallow.get_stats()
     lang_summary = ", ".join(
@@ -702,7 +790,7 @@ async def set_project_path(path: str) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def get_index_status() -> dict:
     """
     Return the current index status.
@@ -743,11 +831,12 @@ async def build_deep_index(force_rebuild: bool = False) -> dict:
     Returns:
         Dict with files, symbols, errors, embeddings counts and model used.
     """
+    _remember_server_loop()
     _require_project()
     return _start_build_job(force_rebuild=force_rebuild)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def find_files(pattern: str) -> list[str]:
     """
     Search for files matching a glob pattern against the shallow index.
@@ -763,7 +852,7 @@ def find_files(pattern: str) -> list[str]:
     return shallow.find_files(pattern)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def get_file_summary(path: str) -> dict:
     """
     Return the indexed summary for a file: symbols, imports, exports, line count.
@@ -790,7 +879,7 @@ def get_file_summary(path: str) -> dict:
     return summary
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def get_symbol_body(file: str, symbol: str) -> str:
     """
     Retrieve the source code of a specific symbol (function, class, method, etc.).
@@ -821,7 +910,7 @@ def get_symbol_body(file: str, symbol: str) -> str:
     return body
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def search_code(pattern: str, file_pattern: str = "*", max_results: int = 50) -> list[dict]:
     """
     Regex search across project files using ripgrep (or grep as fallback).
@@ -846,7 +935,7 @@ def search_code(pattern: str, file_pattern: str = "*", max_results: int = 50) ->
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 async def semantic_search(query: str, top_k: int = 10) -> list[dict]:
     """
     Natural language semantic search using Ollama embeddings.

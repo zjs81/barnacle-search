@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 from code_indexer import server
@@ -172,3 +173,62 @@ def test_reset_build_state_cancels_runtime_tasks():
     assert cancelled["build"] is True
     assert cancelled["background"] is True
     assert server._background_tasks == set()
+
+
+def test_get_indexing_status_reports_background_activity_while_build_is_queued():
+    server._reset_build_state(project_path="/tmp/project")
+    server._transition_build_state(
+        server.BuildStatus.QUEUED,
+        started_at=time.time() - 2,
+        phase="queued",
+        phase_started_at=time.time() - 2,
+        message="Deep index build queued. Call get_index_status() to track progress.",
+    )
+
+    with server._track_index_activity(
+        "sync",
+        "Synchronizing files changed while the server was offline.",
+    ):
+        status = server._get_indexing_status()
+
+    assert status["status"] == "running"
+    assert status["in_progress"] is True
+    assert status["phase"] == "sync"
+    assert status["message"] == "Synchronizing files changed while the server was offline."
+    assert status["finished_at"] is None
+
+
+def test_rebuild_callback_schedules_embedding_from_watcher_thread(monkeypatch):
+    async def scenario():
+        embedded = asyncio.Event()
+        rebuilt: list[str] = []
+
+        class _Deep:
+            def rebuild_file(self, file_path):
+                rebuilt.append(file_path)
+
+        async def fake_embed_pending():
+            embedded.set()
+
+        monkeypatch.setattr(server, "_embed_pending", fake_embed_pending)
+        server._state.update(
+            {
+                "project_path": "/tmp/project",
+                "cache_dir": "/tmp/cache",
+                "shallow": _DummyShallow(),
+                "deep": _Deep(),
+                "vector": object(),
+            }
+        )
+        server._reset_build_state(project_path="/tmp/project")
+        server._server_loop = asyncio.get_running_loop()
+
+        thread = threading.Thread(target=server._rebuild_callback, args=("/tmp/project/a.py",))
+        thread.start()
+        thread.join(timeout=1.0)
+
+        assert thread.is_alive() is False
+        assert rebuilt == ["/tmp/project/a.py"]
+        await _wait_for(embedded.is_set)
+
+    asyncio.run(scenario())

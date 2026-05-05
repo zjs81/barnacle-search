@@ -118,9 +118,7 @@ function Remove-ClaudeInstall {
     if ($settingsConfig -and ($settingsConfig.PSObject.Properties.Name -contains "permissions")) {
         $permissions = $settingsConfig.permissions
         if ($permissions -and ($permissions.PSObject.Properties.Name -contains "allow")) {
-            $allow = @($permissions.allow) | Where-Object {
-                $_ -ne "mcp__barnacle-search" -and $_ -ne "mcp__barnacle-search__*"
-            }
+            $allow = @($permissions.allow) | Where-Object { $_ -ne "mcp__barnacle-search" }
             if ($allow.Count -gt 0) {
                 $permissions.allow = $allow
             } else {
@@ -141,9 +139,17 @@ function Remove-CodexInstall {
         Write-Host "Codex config not found; nothing to remove."
     } else {
         $codexConfig = Get-Content $CodexToml -Raw
-        $pattern = '(?ms)^\[mcp_servers\."barnacle-search"\]\r?\n.*?(?:\r?\n(?=^\[[^\r\n]+\]\r?\n)|\z)'
-        if ($codexConfig -match $pattern) {
-            $updatedCodexConfig = [regex]::Replace($codexConfig, $pattern, "").TrimEnd()
+        $markerPattern = '(?ms)\r?\n?^# barnacle-search:codex-config:start\r?\n.*?^# barnacle-search:codex-config:end\r?\n?'
+        $legacyPattern = '(?ms)\r?\n?^\[mcp_servers\."barnacle-search"\]\r?\n(?:.*\r?\n)*?(?=^\[(?!mcp_servers\."barnacle-search"(?:[".]|$))[^\r\n]+\]\r?\n|\z)'
+        if ($codexConfig -match $markerPattern) {
+            $updatedCodexConfig = [regex]::Replace($codexConfig, $markerPattern, "").TrimEnd()
+            if ($updatedCodexConfig) {
+                $updatedCodexConfig += "`r`n"
+            }
+            $updatedCodexConfig | Set-Content $CodexToml -Encoding UTF8
+            Write-Host "Removed barnacle-search from $CodexToml"
+        } elseif ($codexConfig -match $legacyPattern) {
+            $updatedCodexConfig = [regex]::Replace($codexConfig, $legacyPattern, "").TrimEnd()
             if ($updatedCodexConfig) {
                 $updatedCodexConfig += "`r`n"
             }
@@ -479,9 +485,8 @@ If Barnacle results are low-signal, the index is not ready, or the task is an ex
     }
 
     $allowRules = @($settingsConfig.permissions.allow)
-    if ($allowRules -notcontains "mcp__barnacle-search") {
-        $allowRules += "mcp__barnacle-search"
-    }
+    if ($allowRules -notcontains "mcp__barnacle-search") { $allowRules += "mcp__barnacle-search" }
+    $allowRules = @($allowRules | Where-Object { $_ -ne "mcp__barnacle-search__*" })
     $settingsConfig.permissions.allow = $allowRules
 
     $settingsConfig | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettings -Encoding UTF8
@@ -496,10 +501,30 @@ if (@($InstallTarget -split ",") -contains "codex") {
     }
 
     $codexBlock = @"
+# barnacle-search:codex-config:start
 [mcp_servers."barnacle-search"]
 command = "uv"
 args = ["--directory", "$RepoDir", "run", "barnacle-search"]
 env = { UV_CACHE_DIR = "$env:TEMP\\barnacle-search-uv-cache" }
+
+[mcp_servers."barnacle-search".tools.get_index_status]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.find_files]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.get_file_summary]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.get_symbol_body]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.search_code]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.semantic_search]
+approval_mode = "approve"
+# barnacle-search:codex-config:end
 "@
 
     if (Test-Path $CodexToml) {
@@ -508,9 +533,12 @@ env = { UV_CACHE_DIR = "$env:TEMP\\barnacle-search-uv-cache" }
         $codexConfig = ""
     }
 
-    $pattern = '(?ms)^\[mcp_servers\."barnacle-search"\]\r?\n.*?(?=^\[[^\r\n]+\]\r?\n|\z)'
-    if ($codexConfig -match $pattern) {
-        $updatedCodexConfig = [regex]::Replace($codexConfig, $pattern, $codexBlock)
+    $markerPattern = '(?ms)^# barnacle-search:codex-config:start\r?\n.*?^# barnacle-search:codex-config:end\r?\n?'
+    $legacyPattern = '(?ms)^\[mcp_servers\."barnacle-search"\]\r?\n(?:.*\r?\n)*?(?=^\[(?!mcp_servers\."barnacle-search"(?:[".]|$))[^\r\n]+\]\r?\n|\z)'
+    if ($codexConfig -match $markerPattern) {
+        $updatedCodexConfig = [regex]::Replace($codexConfig, $markerPattern, $codexBlock)
+    } elseif ($codexConfig -match $legacyPattern) {
+        $updatedCodexConfig = [regex]::Replace($codexConfig, $legacyPattern, $codexBlock)
     } elseif ([string]::IsNullOrWhiteSpace($codexConfig)) {
         $updatedCodexConfig = $codexBlock
     } else {

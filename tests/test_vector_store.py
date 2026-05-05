@@ -152,6 +152,31 @@ class TestVectorStoreSearch:
         assert len(results) > 0
         assert results[0]["file"] == "/p/auth.py"
 
+    def test_embedding_cache_invalidates_when_vectors_change(self, tmp_path):
+        db = SnapshotStore(str(tmp_path / "cache.bin"))
+        vs = VectorStore(db)
+        a = FileInfo(path="/p/a.py", language="python", line_count=10, mtime=0.0)
+        b = FileInfo(path="/p/b.py", language="python", line_count=10, mtime=0.0)
+        a_id = db.upsert_file(a)
+        b_id = db.upsert_file(b)
+        db.insert_symbols(
+            a_id,
+            [SymbolInfo(type="method", name="a", symbol_id="a::m", file="/p/a.py", line=1, end_line=5)],
+        )
+        db.insert_symbols(
+            b_id,
+            [SymbolInfo(type="method", name="b", symbol_id="b::m", file="/p/b.py", line=1, end_line=5)],
+        )
+        db.upsert_symbol_embedding("a::m", "m", [1.0, 0.0])
+        db.upsert_symbol_embedding("b::m", "m", [0.0, 1.0])
+
+        assert vs.search([1.0, 0.0], top_k=1)[0]["file"] == "/p/a.py"
+
+        db.upsert_symbol_embedding("a::m", "m", [0.0, 1.0])
+        db.upsert_symbol_embedding("b::m", "m", [1.0, 0.0])
+
+        assert vs.search([1.0, 0.0], top_k=1)[0]["file"] == "/p/b.py"
+
     def test_get_count(self, populated_store):
         vs, _ = populated_store
         assert vs.get_count() == 4

@@ -228,7 +228,7 @@ permissions = config.get("permissions")
 if isinstance(permissions, dict):
     allow = permissions.get("allow")
     if isinstance(allow, list):
-        allow = [rule for rule in allow if rule not in ("mcp__barnacle-search", "mcp__barnacle-search__*")]
+        allow = [rule for rule in allow if rule != "mcp__barnacle-search"]
         if allow:
             permissions["allow"] = allow
         else:
@@ -263,10 +263,15 @@ codex_toml = os.path.expanduser("~/.codex/config.toml")
 with open(codex_toml, "r", encoding="utf-8") as f:
     existing = f.read()
 
-pattern = re.compile(
-    r'(?ms)^\[mcp_servers\."barnacle-search"\]\n.*?(?:\n(?=^\[[^\n]+\]\n)|\Z)'
+marker_pattern = re.compile(
+    r'(?ms)\n?^# barnacle-search:codex-config:start\n.*?^# barnacle-search:codex-config:end\n?'
 )
-updated, count = pattern.subn("", existing)
+legacy_pattern = re.compile(
+    r'(?ms)\n?^\[mcp_servers\."barnacle-search"\]\n(?:.*\n)*?(?=^\[(?!mcp_servers\."barnacle-search"(?:[".]|$))[^\n]+\]\n|\Z)'
+)
+updated, count = marker_pattern.subn("", existing)
+if count == 0:
+    updated, count = legacy_pattern.subn("", existing)
 updated = updated.rstrip() + ("\n" if updated.strip() else "")
 
 with open(codex_toml, "w", encoding="utf-8") as f:
@@ -597,6 +602,8 @@ permissions = config.setdefault("permissions", {})
 allow = permissions.setdefault("allow", [])
 if "mcp__barnacle-search" not in allow:
     allow.append("mcp__barnacle-search")
+allow = [rule for rule in allow if rule != "mcp__barnacle-search__*"]
+permissions["allow"] = allow
 
 with open(claude_settings, "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
@@ -620,10 +627,30 @@ import os, re
 codex_toml = os.path.expanduser("~/.codex/config.toml")
 os.makedirs(os.path.dirname(codex_toml), exist_ok=True)
 
-block = """[mcp_servers."barnacle-search"]
+block = """# barnacle-search:codex-config:start
+[mcp_servers."barnacle-search"]
 command = "uv"
 args = ["--directory", "$REPO_DIR", "run", "barnacle-search"]
 env = { UV_CACHE_DIR = "/tmp/barnacle-search-uv-cache" }
+
+[mcp_servers."barnacle-search".tools.get_index_status]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.find_files]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.get_file_summary]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.get_symbol_body]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.search_code]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.semantic_search]
+approval_mode = "approve"
+# barnacle-search:codex-config:end
 """
 
 existing = ""
@@ -631,12 +658,17 @@ if os.path.exists(codex_toml):
     with open(codex_toml, "r", encoding="utf-8") as f:
         existing = f.read()
 
-pattern = re.compile(
-    r'(?ms)^\[mcp_servers\."barnacle-search"\]\n.*?(?=^\[[^\n]+\]\n|\Z)'
+marker_pattern = re.compile(
+    r'(?ms)^# barnacle-search:codex-config:start\n.*?^# barnacle-search:codex-config:end\n?'
+)
+legacy_pattern = re.compile(
+    r'(?ms)^\[mcp_servers\."barnacle-search"\]\n(?:.*\n)*?(?=^\[(?!mcp_servers\."barnacle-search"(?:[".]|$))[^\n]+\]\n|\Z)'
 )
 
-if pattern.search(existing):
-    updated = pattern.sub(block, existing).rstrip() + "\n"
+if marker_pattern.search(existing):
+    updated = marker_pattern.sub(block, existing).rstrip() + "\n"
+elif legacy_pattern.search(existing):
+    updated = legacy_pattern.sub(block, existing).rstrip() + "\n"
 else:
     prefix = existing.rstrip()
     if prefix:

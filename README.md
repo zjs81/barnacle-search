@@ -94,7 +94,27 @@ If Codex shows `barnacle-search` as enabled but lists `Tools: (none)`, the MCP p
 command = "uv"
 args = ["--directory", "/absolute/path/to/barnacle-search", "run", "barnacle-search"]
 env = { UV_CACHE_DIR = "/tmp/barnacle-search-uv-cache" }
+
+[mcp_servers."barnacle-search".tools.get_index_status]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.find_files]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.get_file_summary]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.get_symbol_body]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.search_code]
+approval_mode = "approve"
+
+[mcp_servers."barnacle-search".tools.semantic_search]
+approval_mode = "approve"
 ```
+
+Codex supports per-tool approval overrides for custom MCP servers under `mcp_servers.<server>.tools.<tool>`. Approving Barnacle's read-only query tools there prevents review prompts for safe reads like `get_symbol_body()` while keeping mutating tools on normal approval rules.
 
 For OpenCode, add the MCP server under `mcp` in `~/.config/opencode/opencode.json`:
 
@@ -110,6 +130,17 @@ For OpenCode, add the MCP server under `mcp` in `~/.config/opencode/opencode.jso
         "UV_CACHE_DIR": "/tmp/barnacle-search-uv-cache"
       }
     }
+  }
+}
+```
+
+If you run OpenCode with restrictive permissions, add explicit Barnacle MCP allow rules too:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "barnacle-search_*": "allow"
   }
 }
 ```
@@ -171,7 +202,11 @@ The setup scripts also add global guidance blocks under `~/.codex/AGENTS.md` and
 
 For Claude Code, the setup scripts also add a global guidance block under `~/.claude/CLAUDE.md`. This matters because MCP registration makes the server available, but Claude memory is what tells Claude to prefer Barnacle for exploratory codebase work and to call `set_project_path()` before other Barnacle tools.
 
-They also add `mcp__barnacle-search` to `~/.claude/settings.json` under `permissions.allow`, which follows Claude Code's MCP permission syntax for allowing all tools from a specific MCP server.
+They also add `mcp__barnacle-search` to `~/.claude/settings.json` under `permissions.allow`, which follows Claude Code's MCP permission syntax for allowing all tools from a specific MCP server. Claude permission rules should use the server-level entry; wildcard variants like `mcp__barnacle-search__*` are unnecessary here.
+
+The Codex setup also writes per-tool approval overrides for Barnacle's read-only query tools, because Codex stores custom MCP approval behavior under `mcp_servers.<server>.tools.<tool>` in `~/.codex/config.toml`.
+
+OpenCode is usually permissive by default, but if you configure global `ask` behavior, add explicit allow rules for Barnacle MCP tools. A wildcard like `barnacle-search_*` is the simplest form.
 
 OpenCode supports `AGENTS.md` natively and its config is merged from `~/.config/opencode/opencode.json` plus project settings, so the dedicated OpenCode registration keeps Barnacle available even when Claude-specific files are absent.
 

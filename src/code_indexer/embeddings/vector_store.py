@@ -20,6 +20,8 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 class VectorStore:
     def __init__(self, store: SnapshotStore):
         self.store = store
+        self._embedding_cache_revision = -1
+        self._embedding_cache: list[tuple[str, str, str, list[float]]] = []
 
     def upsert_symbol(self, symbol_id: str, model: str, vector: list[float]):
         self.store.upsert_symbol_embedding(symbol_id, model, vector)
@@ -44,21 +46,23 @@ class VectorStore:
         sorted by blended score, descending.
         """
         query_dim = len(query_vector)
+        query_norm = math.sqrt(sum(value * value for value in query_vector))
+        if query_dim == 0 or query_norm == 0.0:
+            return []
+        normalized_query = [value / query_norm for value in query_vector]
 
         # ── Cosine scores ────────────────────────────────────────────────────
         cosine_by_sym: dict[str, float] = {}
         sym_meta: dict[str, tuple[str, str]] = {}  # symbol_id -> (short_name, file_path)
-        for sym_id, short_name, file_path, _parent, vector in self.store.get_all_symbol_embeddings():
+        for sym_id, short_name, file_path, vector in self._get_normalized_embeddings():
             if len(vector) != query_dim:
                 continue
-            score = cosine_similarity(query_vector, vector)
+            score = sum(q * v for q, v in zip(normalized_query, vector))
             cosine_by_sym[sym_id] = score
             sym_meta[sym_id] = (short_name, file_path)
 
         if not cosine_by_sym:
             return []
-
-        max_cosine = max(cosine_by_sym.values()) or 1.0
 
         # ── Keyword scores ───────────────────────────────────────────────────
         fts_by_sym: dict[str, float] = {}
@@ -76,7 +80,7 @@ class VectorStore:
         blended: list[dict] = []
         for sym_id, cosine_score in cosine_by_sym.items():
             short_name, file_path = sym_meta[sym_id]
-            norm_cosine = cosine_score / max_cosine
+            norm_cosine = min(max((cosine_score + 1.0) / 2.0, 0.0), 1.0)
             kw_score = fts_by_sym.get(sym_id, 0.0)
             final = COSINE_W * norm_cosine + KEYWORD_W * kw_score
             blended.append({
@@ -101,3 +105,19 @@ class VectorStore:
 
     def get_count(self) -> int:
         return self.store.get_symbol_embedding_count()
+
+    def _get_normalized_embeddings(self) -> list[tuple[str, str, str, list[float]]]:
+        revision = self.store.get_embedding_revision()
+        if revision == self._embedding_cache_revision:
+            return self._embedding_cache
+
+        cache: list[tuple[str, str, str, list[float]]] = []
+        for sym_id, short_name, file_path, _parent, vector in self.store.get_all_symbol_embeddings():
+            norm = math.sqrt(sum(value * value for value in vector))
+            if norm == 0.0:
+                continue
+            cache.append((sym_id, short_name, file_path, [value / norm for value in vector]))
+
+        self._embedding_cache = cache
+        self._embedding_cache_revision = revision
+        return cache

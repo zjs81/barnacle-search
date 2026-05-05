@@ -135,53 +135,105 @@ class IndexBuilder:
         if progress_callback is not None:
             progress_callback(0, len(files))
 
-        with ThreadPoolExecutor(max_workers=INDEX_MAX_WORKERS) as executor:
-            futures = {executor.submit(self._process_file, fp): fp for fp in files}
+        if not files:
+            return {"files": 0, "symbols": 0, "errors": 0}
+
+        worker_count = min(INDEX_MAX_WORKERS, len(files))
+        ordered_files = self._sort_files_by_size_desc(files)
+        partitions = self._partition_files_evenly(ordered_files, worker_count)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(self._process_file_batch, batch): batch
+                for batch in partitions
+            }
             for future in as_completed(futures):
-                fp = futures[future]
+                batch = futures[future]
                 try:
-                    result = future.result()
+                    parsed_batch = future.result()
                 except Exception as exc:
-                    log.warning("Unexpected error processing %s: %s", fp, exc)
-                    total_errors += 1
-                    processed += 1
-                    if progress_callback is not None:
-                        progress_callback(processed, len(files))
-                    continue
+                    log.warning("Unexpected error processing batch of %d files: %s", len(batch), exc)
+                    parsed_batch = [(fp, None, str(exc)) for fp in batch]
 
-                if result is None:
-                    total_errors += 1
-                    processed += 1
-                    if progress_callback is not None:
-                        progress_callback(processed, len(files))
-                    continue
-
-                file_info, symbols = result
-                if file_info.error:
-                    total_errors += 1
-
-                try:
-                    self.store.persist_file_and_symbols(
-                        file_info,
-                        symbols,
-                        replace_existing=replace_existing,
-                        commit=False,
-                    )
-                except Exception as exc:
-                    log.warning("DB write failed for %s: %s", fp, exc)
-                    total_errors += 1
-                    processed += 1
-                    if progress_callback is not None:
-                        progress_callback(processed, len(files))
-                    continue
-
-                total_files += 1
-                total_symbols += len(symbols)
-                processed += 1
+                batch_stats = self._persist_parsed_batch(
+                    parsed_batch,
+                    replace_existing=replace_existing,
+                )
+                total_files += batch_stats["files"]
+                total_symbols += batch_stats["symbols"]
+                total_errors += batch_stats["errors"]
+                processed += len(batch)
                 if progress_callback is not None:
                     progress_callback(processed, len(files))
 
         return {"files": total_files, "symbols": total_symbols, "errors": total_errors}
+
+    def _persist_parsed_batch(
+        self,
+        batch: list[tuple[str, Optional[tuple[FileInfo, list[SymbolInfo]]], Optional[str]]],
+        *,
+        replace_existing: bool,
+    ) -> dict:
+        total_files = 0
+        total_symbols = 0
+        total_errors = 0
+        for fp, result, unexpected_error in batch:
+            if unexpected_error is not None:
+                total_errors += 1
+                continue
+
+            if result is None:
+                total_errors += 1
+                continue
+
+            file_info, symbols = result
+            if file_info.error:
+                total_errors += 1
+
+            try:
+                self.store.persist_file_and_symbols(
+                    file_info,
+                    symbols,
+                    replace_existing=replace_existing,
+                    commit=False,
+                )
+            except Exception as exc:
+                log.warning("DB write failed for %s: %s", fp, exc)
+                total_errors += 1
+                continue
+
+            total_files += 1
+            total_symbols += len(symbols)
+
+        return {"files": total_files, "symbols": total_symbols, "errors": total_errors}
+
+    def _sort_files_by_size_desc(self, files: list[str]) -> list[str]:
+        return sorted(files, key=self._file_size_for_partition, reverse=True)
+
+    def _file_size_for_partition(self, file_path: str) -> int:
+        try:
+            return os.path.getsize(file_path)
+        except OSError:
+            return 0
+
+    def _partition_files_evenly(self, files: list[str], worker_count: int) -> list[list[str]]:
+        partitions = [[] for _ in range(max(worker_count, 1))]
+        for index, file_path in enumerate(files):
+            partitions[index % len(partitions)].append(file_path)
+        return [partition for partition in partitions if partition]
+
+    def _process_file_batch(
+        self,
+        files: list[str],
+    ) -> list[tuple[str, Optional[tuple[FileInfo, list[SymbolInfo]]], Optional[str]]]:
+        results: list[tuple[str, Optional[tuple[FileInfo, list[SymbolInfo]]], Optional[str]]] = []
+        for fp in files:
+            try:
+                results.append((fp, self._process_file(fp), None))
+            except Exception as exc:
+                log.warning("Unexpected error processing %s: %s", fp, exc)
+                results.append((fp, None, str(exc)))
+        return results
 
     def _finalize_build_metadata(self) -> None:
         self.store.set_meta_many(

@@ -57,6 +57,7 @@ class SnapshotStore:
         self._file_id_to_path: dict[int, str] = {}
         self._symbols_by_name: dict[str, set[str]] = {}
         self._keyword_index: dict[str, dict[str, int]] = {}
+        self._embedding_revision = 0
         self._load_from_disk()
 
     def _empty_state(self) -> dict:
@@ -142,6 +143,7 @@ class SnapshotStore:
 
             self._state = self._normalize_state(self._deserialize_state(raw))
             self._rebuild_indexes()
+            self._bump_embedding_revision()
 
     def refresh_from_disk(self) -> None:
         self._load_from_disk()
@@ -202,6 +204,9 @@ class SnapshotStore:
         for record in self._state["symbols"].values():
             self._index_symbol(record)
 
+    def _bump_embedding_revision(self) -> None:
+        self._embedding_revision += 1
+
     def _index_symbol(self, record: dict) -> None:
         symbol_id = record["symbol_id"]
         short_name = record.get("short_name") or ""
@@ -258,15 +263,19 @@ class SnapshotStore:
 
     def _replace_file_rows(self, path: str) -> None:
         symbol_ids = self._state["symbols_by_file"].pop(path, [])
+        removed_embedding = False
         for symbol_id in symbol_ids:
             record = self._state["symbols"].pop(symbol_id, None)
             if record is not None:
                 self._unindex_symbol(record)
-            self._state["embeddings"].pop(symbol_id, None)
+            if self._state["embeddings"].pop(symbol_id, None) is not None:
+                removed_embedding = True
 
         record = self._state["files"].pop(path, None)
         if record is not None:
             self._file_id_to_path.pop(int(record["id"]), None)
+        if removed_embedding:
+            self._bump_embedding_revision()
 
     def _file_row_values(self, file_info: FileInfo, file_id: int) -> dict:
         return {
@@ -327,12 +336,15 @@ class SnapshotStore:
 
     def clear_files(self, *, commit: bool = True):
         with self._mutex:
+            had_embeddings = bool(self._state["embeddings"])
             self._state["files"] = {}
             self._state["symbols"] = {}
             self._state["symbols_by_file"] = {}
             self._state["embeddings"] = {}
             self._state["next_file_id"] = 1
             self._rebuild_indexes()
+            if had_embeddings:
+                self._bump_embedding_revision()
             self._commit_if_needed(commit)
 
     def get_file(self, path: str) -> Optional[dict]:
@@ -499,6 +511,7 @@ class SnapshotStore:
                 "vector": [float(v) for v in vector],
                 "updated_at": time.time(),
             }
+            self._bump_embedding_revision()
             self._commit_if_needed(commit)
 
     def bulk_upsert_symbol_embeddings(
@@ -517,11 +530,15 @@ class SnapshotStore:
                     "vector": [float(v) for v in vector],
                     "updated_at": now,
                 }
+            self._bump_embedding_revision()
             self._commit_if_needed(commit)
 
     def clear_symbol_embeddings(self, *, commit: bool = True):
         with self._mutex:
+            had_embeddings = bool(self._state["embeddings"])
             self._state["embeddings"] = {}
+            if had_embeddings:
+                self._bump_embedding_revision()
             self._commit_if_needed(commit)
 
     def get_all_symbol_embeddings(self) -> list[tuple[str, str, str, Optional[str], list[float]]]:
@@ -547,6 +564,9 @@ class SnapshotStore:
 
     def get_symbol_embedding_count(self) -> int:
         return len(self._state["embeddings"])
+
+    def get_embedding_revision(self) -> int:
+        return self._embedding_revision
 
     def get_symbols_needing_embedding(self) -> list[dict]:
         pending: list[dict] = []
